@@ -7,11 +7,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"time"
 
 	"agpass/internal/api"
 	"agpass/internal/events"
 	"agpass/internal/llm"
+	"agpass/internal/peer"
 	"agpass/internal/redact"
 	"agpass/internal/store"
 )
@@ -21,7 +21,6 @@ var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/status", s.handle(authNone, s.status))
-	mux.HandleFunc("POST /v1/unlock", s.handle(authNone, s.unlock))
 	mux.HandleFunc("POST /v1/mint", s.handle(authAdmin, s.mint))
 	mux.HandleFunc("POST /v1/connect", s.handle(authAgent, s.connect))
 	mux.HandleFunc("GET /v1/whoami", s.handle(authSession, s.whoami))
@@ -38,22 +37,6 @@ func (s *Server) status(r *http.Request, c *caller) (any, error) {
 	return api.StatusResponse{Version: api.Version, Unlocked: s.Unlocked()}, nil
 }
 
-func (s *Server) unlock(r *http.Request, c *caller) (any, error) {
-	var req api.UnlockRequest
-	if err := decode(r, &req); err != nil {
-		return nil, err
-	}
-	if s.Unlocked() {
-		return api.StatusResponse{Version: api.Version, Unlocked: true}, nil
-	}
-	if err := s.Unlock(req.Password); err != nil {
-		time.Sleep(time.Second)
-		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "unlock", Msg: err.Error()})
-		return nil, errf(http.StatusUnauthorized, api.ErrForbidden, "%v", err)
-	}
-	return api.StatusResponse{Version: api.Version, Unlocked: true}, nil
-}
-
 func (s *Server) mint(r *http.Request, c *caller) (any, error) {
 	m := s.mintCode()
 	s.Log.Emit(events.Event{Level: events.LevelOK, Action: "mint", Actor: c.String(), Msg: "connect code valid until " + m.ExpiresAt.Format("15:04:05")})
@@ -68,19 +51,26 @@ func (s *Server) connect(r *http.Request, c *caller) (any, error) {
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
-	if err := s.redeemCode(strings.TrimSpace(req.Code)); err != nil {
+	if c.session != nil { // already connected: keep the code for another session
+		s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "connect", Actor: c.String(), Msg: "already connected; code not used"})
+		return s.sessionInfo(c.session)
+	}
+	restore, err := s.redeemCode(strings.TrimSpace(req.Code))
+	if err != nil {
 		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "connect", Actor: c.String(), Msg: err.Error()})
 		return nil, err
 	}
+	cwd, _ := peer.Cwd(c.agent.PID) // the agent's own cwd, not what the client claims
 	sess, err := s.st.UpsertSession(store.Session{
 		ID: randomID("s-"), PID: c.agent.PID, StartUS: c.agent.StartUS,
-		Agent: c.name, Exe: c.agent.Exe, Cwd: req.Cwd,
+		Agent: c.name, Exe: c.agent.Exe, Cwd: cwd,
 	})
 	if err != nil {
+		restore()
 		return nil, err
 	}
 	c.session = &sess
-	s.Log.Emit(events.Event{Level: events.LevelOK, Action: "connect", Actor: c.String(), Target: req.Cwd, Msg: "session bound to " + c.agent.Exe})
+	s.Log.Emit(events.Event{Level: events.LevelOK, Action: "connect", Actor: c.String(), Target: cwd, Msg: "session bound to " + c.agent.Exe})
 	return s.sessionInfo(&sess)
 }
 
@@ -117,11 +107,22 @@ func (s *Server) requestAccess(r *http.Request, c *caller) (any, error) {
 	if strings.TrimSpace(req.Reason) == "" {
 		return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "a reason is required: say what you are working on and why you need secrets")
 	}
-	repo := NormalizeRepo(req.Repo)
-	if err := s.st.UpdateSessionClaims(c.session.ID, req.Cwd, repo, req.Reason); err != nil {
+	// The repository is worked out from the agent process's own working
+	// directory. What the client says (--repo, its cwd) is only a claim: the
+	// LLM sees it, repository matching never uses it.
+	cwd, err := peer.Cwd(c.agent.PID)
+	if err != nil {
+		return nil, fmt.Errorf("read working directory of %s pid %d: %w", c.name, c.agent.PID, err)
+	}
+	repo := NormalizeRepo(GitOrigin(cwd))
+	claimed := NormalizeRepo(req.Repo)
+	if claimed == repo {
+		claimed = ""
+	}
+	if err := s.st.UpdateSessionClaims(c.session.ID, cwd, repo, req.Reason); err != nil {
 		return nil, err
 	}
-	c.session.Cwd, c.session.Repo, c.session.Reason = req.Cwd, repo, req.Reason
+	c.session.Cwd, c.session.Repo, c.session.Reason = cwd, repo, req.Reason
 
 	have, err := s.grantSet(c)
 	if err != nil {
@@ -155,7 +156,11 @@ func (s *Server) requestAccess(r *http.Request, c *caller) (any, error) {
 			}
 			continue
 		}
-		candidates = append(candidates, llm.FolderInfo{Name: f.Name, Project: f.Project, Description: f.Description, Repos: f.Repos})
+		writtenBy := "agent" // created or last edited by an agent session: untrusted
+		if f.UpdatedBy == "human" || f.UpdatedBy == "server" {
+			writtenBy = "owner"
+		}
+		candidates = append(candidates, llm.FolderInfo{Name: f.Name, Project: f.Project, Description: f.Description, Repos: f.Repos, WrittenBy: writtenBy})
 	}
 
 	// 2. LLM: when nothing matched, or the agent asked for folders it doesn't have yet.
@@ -165,7 +170,7 @@ func (s *Server) requestAccess(r *http.Request, c *caller) (any, error) {
 		if key == "" {
 			resp.Explanation = "LLM gatekeeper not configured (store the API key as SYSTEM/anthropic field api_key); only repository matches are granted"
 		} else {
-			d, err := llm.Decide(r.Context(), key, llm.Request{Repo: repo, Cwd: req.Cwd, Reason: req.Reason, Requested: req.Folders, Folders: candidates})
+			d, err := llm.Decide(r.Context(), key, llm.Request{Repo: repo, ClaimedRepo: claimed, Cwd: cwd, Reason: req.Reason, Requested: req.Folders, Folders: candidates})
 			if err != nil {
 				s.Log.Emit(events.Event{Level: events.LevelWarn, Action: "llm", Actor: c.String(), Msg: err.Error()})
 				resp.Explanation = "LLM gatekeeper failed: " + err.Error()
@@ -330,8 +335,18 @@ func (s *Server) setItem(r *http.Request, c *caller) (any, error) {
 	if len(req.Fields) == 0 && len(req.Remove) == 0 {
 		return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "nothing to set")
 	}
+	removing := map[string]bool{}
+	for _, k := range req.Remove {
+		if !nameRe.MatchString(k) {
+			return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "invalid field key %q", k)
+		}
+		removing[k] = true
+	}
 	seen := map[string]bool{}
 	for i, f := range req.Fields {
+		if removing[f.Key] {
+			return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "field %q is both set and removed", f.Key)
+		}
 		if f.Type == "" {
 			req.Fields[i].Type = api.TypeText
 		}
@@ -345,7 +360,7 @@ func (s *Server) setItem(r *http.Request, c *caller) (any, error) {
 	}
 	it, err := s.st.SetItem(folder, name, req.Fields, req.Remove, c.String())
 	if errors.Is(err, store.ErrNotFound) {
-		return nil, errf(http.StatusNotFound, api.ErrNotFound, "folder %q not found", folder)
+		return nil, errf(http.StatusNotFound, api.ErrNotFound, "%v", err)
 	}
 	if err != nil {
 		return nil, err
@@ -421,30 +436,6 @@ func (s *Server) editFolder(r *http.Request, c *caller) (any, error) {
 	}
 	s.Log.Emit(events.Event{Level: events.LevelOK, Action: "folder-edit", Actor: c.String(), Target: req.Name, Msg: strings.Join(changed, " ")})
 	return f, nil
-}
-
-// NormalizeRepo turns git remotes into host/owner/repo:
-// git@github.com:x/crm.git, https://github.com/x/crm → github.com/x/crm.
-func NormalizeRepo(r string) string {
-	r = strings.ToLower(strings.TrimSpace(r))
-	if r == "" {
-		return ""
-	}
-	if i := strings.Index(r, "://"); i >= 0 {
-		r = r[i+3:]
-	} else if c := strings.IndexByte(r, ':'); c >= 0 && (strings.IndexByte(r, '/') < 0 || c < strings.IndexByte(r, '/')) {
-		r = r[:c] + "/" + r[c+1:] // scp-like syntax
-	}
-	hostEnd := strings.IndexByte(r, '/')
-	if hostEnd < 0 {
-		hostEnd = len(r)
-	}
-	if at := strings.LastIndexByte(r[:hostEnd], '@'); at >= 0 {
-		r = r[at+1:]
-	}
-	r = strings.TrimSuffix(r, "/")
-	r = strings.TrimSuffix(r, ".git")
-	return r
 }
 
 func fieldKeys(fs []api.Field) string {

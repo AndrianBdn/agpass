@@ -2,6 +2,7 @@ package store
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,8 +10,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"agpass/internal/api"
+	"agpass/internal/events"
 )
 
 func openTest(t *testing.T) (*Store, string) {
@@ -97,5 +100,50 @@ func TestConcurrentUpsertSession(t *testing.T) {
 		} else if id != first {
 			t.Fatalf("same process got two sessions: %s and %s", first, id)
 		}
+	}
+}
+
+func TestSetItemRemove(t *testing.T) {
+	s, _ := openTest(t)
+	if err := s.CreateFolder(api.FolderRequest{Name: "crm"}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	// Remove-only on a missing item must not create it.
+	_, err := s.SetItem("crm", "typo", nil, []string{"x"}, "test")
+	if !errors.Is(err, ErrNotFound) || err.Error() != "item crm/typo not found" {
+		t.Fatalf("remove on missing item: %v", err)
+	}
+	if _, err := s.GetItem("crm", "typo"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("remove-only created the item")
+	}
+	if _, err := s.SetItem("nope", "x", []api.Field{{Key: "a", Value: "1"}}, nil, "test"); err == nil || err.Error() != `folder "nope" not found` {
+		t.Fatalf("missing folder: %v", err)
+	}
+	if _, err := s.SetItem("crm", "db", []api.Field{{Key: "a", Type: api.TypeText, Value: "1"}}, nil, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetItem("crm", "db", nil, []string{"b"}, "test"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("remove missing field: %v", err)
+	}
+	it, err := s.SetItem("crm", "db", nil, []string{"a"}, "test")
+	if err != nil || len(it.Fields) != 0 || it.Version != 2 {
+		t.Fatalf("remove field: %+v %v", it, err)
+	}
+}
+
+func TestEvents(t *testing.T) {
+	s, _ := openTest(t)
+	base := time.Now()
+	for i := range 5 {
+		if err := s.AddEvent(events.Event{Time: base.Add(time.Duration(i) * time.Second), Level: "ok", Action: fmt.Sprintf("a%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.RecentEvents(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].Action != "a2" || got[2].Action != "a4" {
+		t.Fatalf("want a2..a4 oldest first, got %+v", got)
 	}
 }

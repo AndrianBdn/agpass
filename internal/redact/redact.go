@@ -8,8 +8,11 @@ import (
 	"agpass/internal/api"
 )
 
-// scheme://user:password@ — password group is replaced.
-var urlPassword = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@]*:)([^\s@]+)@`)
+// scheme://user:password@ — password group is replaced. The password runs
+// to the last '@' before whitespace, so an unencoded '@' in it (p@ss@host)
+// is covered. When a later '@' appears in the path or query, more than the
+// password is redacted, never less.
+var urlPassword = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@]*:)(\S+)@`)
 
 // scheme://longtoken@ — a userinfo without password that looks like a token
 // (e.g. https://ghp_xxx@github.com).

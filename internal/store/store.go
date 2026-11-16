@@ -21,10 +21,17 @@ import (
 	_ "github.com/ncruces/go-sqlite3/vfs/adiantum"
 
 	"agpass/internal/api"
+	"agpass/internal/events"
 )
 
 var ErrNotFound = errors.New("not found")
 var ErrExists = errors.New("already exists")
+
+// notFound is ErrNotFound with a message for the user.
+type notFound string
+
+func (e notFound) Error() string { return string(e) }
+func (e notFound) Unwrap() error { return ErrNotFound }
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
@@ -84,7 +91,23 @@ CREATE TABLE IF NOT EXISTS grants (
 	at          TEXT NOT NULL,
 	PRIMARY KEY (session_id, folder)
 );
+
+-- Audit log. Not counted in the generation: a read is logged too, and
+-- appending must stay cheap.
+CREATE TABLE IF NOT EXISTS events (
+	id     INTEGER PRIMARY KEY,
+	at     TEXT NOT NULL,
+	level  TEXT NOT NULL,
+	action TEXT NOT NULL,
+	actor  TEXT NOT NULL DEFAULT '',
+	target TEXT NOT NULL DEFAULT '',
+	msg    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS events_at ON events (at);
 `
+
+// EventRetention is how long audit events are kept.
+const EventRetention = 90 * 24 * time.Hour
 
 type Store struct {
 	db      *sql.DB
@@ -155,6 +178,10 @@ func Open(dir string, dek []byte, allowRollback bool) (*Store, error) {
 		return nil, err
 	}
 	if err := s.ensureSystemFolder(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`DELETE FROM events WHERE at < ?`, ts(time.Now().Add(-EventRetention))); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -368,7 +395,9 @@ func getItem(q queryer, folder, name string) (api.Item, error) {
 func (s *Store) SetItem(folder, name string, fields []api.Field, remove []string, actor string) (api.Item, error) {
 	var out api.Item
 	err := s.write(func(tx *sql.Tx) error {
-		if _, err := getFolder(tx, folder); err != nil {
+		if _, err := getFolder(tx, folder); errors.Is(err, ErrNotFound) {
+			return notFound(fmt.Sprintf("folder %q not found", folder))
+		} else if err != nil {
 			return err
 		}
 		// Read, merge and write in one transaction so concurrent updates to
@@ -377,6 +406,14 @@ func (s *Store) SetItem(folder, name string, fields []api.Field, remove []string
 		exists := err == nil
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return err
+		}
+		for _, k := range remove {
+			if !slices.ContainsFunc(cur.Fields, func(f api.Field) bool { return f.Key == k }) {
+				if !exists {
+					return notFound(fmt.Sprintf("item %s/%s not found", folder, name))
+				}
+				return notFound(fmt.Sprintf("field %q not found in %s/%s", k, folder, name))
+			}
 		}
 		merged := slices.Clone(cur.Fields)
 		for _, f := range fields {
@@ -490,6 +527,68 @@ func (s *Store) Grant(sessionID, folder, by, explanation string) (api.Grant, err
 		return err
 	})
 	return g, err
+}
+
+// ---- events ----
+
+// AddEvent appends e to the audit log.
+func (s *Store) AddEvent(e events.Event) error {
+	_, err := s.db.Exec(`INSERT INTO events (at, level, action, actor, target, msg) VALUES (?, ?, ?, ?, ?, ?)`,
+		ts(e.Time), e.Level, e.Action, e.Actor, e.Target, e.Msg)
+	return err
+}
+
+// RecentEvents returns the last n events, oldest first.
+func (s *Store) RecentEvents(n int) ([]events.Event, error) {
+	rows, err := s.db.Query(`SELECT at, level, action, actor, target, msg FROM
+		(SELECT * FROM events ORDER BY id DESC LIMIT ?) ORDER BY id`, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []events.Event
+	for rows.Next() {
+		var e events.Event
+		var at string
+		if err := rows.Scan(&at, &e.Level, &e.Action, &e.Actor, &e.Target, &e.Msg); err != nil {
+			return nil, err
+		}
+		e.Time = parseTS(at)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ---- stats ----
+
+type Counts struct {
+	Folders, Items int
+}
+
+func (s *Store) Counts() (Counts, error) {
+	var c Counts
+	err := s.db.QueryRow(`SELECT (SELECT count(*) FROM folders), (SELECT count(*) FROM items)`).Scan(&c.Folders, &c.Items)
+	return c, err
+}
+
+// Sessions returns all sessions (live or not).
+func (s *Store) Sessions() ([]Session, error) {
+	rows, err := s.db.Query(`SELECT id, pid, start_us, agent, exe, cwd, repo, reason, created_at FROM sessions`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Session
+	for rows.Next() {
+		var sess Session
+		var ca string
+		if err := rows.Scan(&sess.ID, &sess.PID, &sess.StartUS, &sess.Agent, &sess.Exe, &sess.Cwd, &sess.Repo, &sess.Reason, &ca); err != nil {
+			return nil, err
+		}
+		sess.CreatedAt = parseTS(ca)
+		out = append(out, sess)
+	}
+	return out, rows.Err()
 }
 
 // ---- helpers ----

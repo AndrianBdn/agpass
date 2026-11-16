@@ -127,10 +127,6 @@ type WhoamiResponse struct {
 	Session *SessionInfo `json:"session,omitempty"`
 }
 
-type UnlockRequest struct {
-	Password string `json:"password"`
-}
-
 type StatusResponse struct {
 	Version  string `json:"version"`
 	Unlocked bool   `json:"unlocked"`

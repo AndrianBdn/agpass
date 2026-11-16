@@ -51,8 +51,19 @@ type Server struct {
 	adminLock  time.Time
 	codeFails  []time.Time
 
+	// masterMu admits one master-password check at a time: each Argon2
+	// verify takes 128 MiB, and failures must be counted before the next
+	// guess is evaluated.
+	masterMu sync.Mutex
+	inflight sync.WaitGroup // running handlers, drained before the store closes
+	ln       net.Listener
 	resolver *peer.Resolver
 }
+
+// MinPasswordLen is the minimum length of a new master password.
+const MinPasswordLen = 10
+
+var ErrNoVault = errors.New("no vault yet: run `agpass serve` in a terminal to create one")
 
 func New(dir string, log *events.Log) *Server {
 	return &Server{Dir: dir, Log: log, otps: map[string]time.Time{}, resolver: peer.NewResolver()}
@@ -60,42 +71,59 @@ func New(dir string, log *events.Log) *Server {
 
 func SocketPath(dir string) string { return filepath.Join(dir, "agpass.sock") }
 func KeyPath(dir string) string    { return filepath.Join(dir, "agpass.key") }
-func EventsPath(dir string) string { return filepath.Join(dir, "events.jsonl") }
 
-// Unlock opens the vault, creating it if no key file exists.
+// Create makes a new vault protected by password. It is only called by
+// `agpass serve` at a terminal, after the password was typed twice; the
+// socket API can never create a vault.
+func (s *Server) Create(password string) error {
+	if len(password) < MinPasswordLen {
+		return fmt.Errorf("use at least %d characters", MinPasswordLen)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if vault.Exists(KeyPath(s.Dir)) {
+		return fmt.Errorf("a vault already exists in %s", s.Dir)
+	}
+	dek, err := vault.Create(KeyPath(s.Dir), password)
+	if err != nil {
+		return err
+	}
+	return s.open(dek, "new vault created")
+}
+
+// Unlock opens the existing vault. It never creates one.
 func (s *Server) Unlock(password string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.st != nil {
 		return nil
 	}
-	var dek []byte
-	var err error
-	created := false
 	if !vault.Exists(KeyPath(s.Dir)) {
-		if dek, err = vault.Create(KeyPath(s.Dir), password); err != nil {
-			return err
-		}
-		created = true
+		return ErrNoVault
 	}
 	kf, err := vault.Load(KeyPath(s.Dir))
 	if err != nil {
 		return err
 	}
-	if dek == nil {
-		if dek, err = kf.Unwrap(password); err != nil {
-			return err
-		}
+	dek, err := kf.Unwrap(password)
+	if err != nil {
+		return err
+	}
+	return s.open(dek, "vault unlocked")
+}
+
+// open loads the key file and opens the store; s.mu must be held.
+func (s *Server) open(dek []byte, msg string) error {
+	kf, err := vault.Load(KeyPath(s.Dir))
+	if err != nil {
+		return err
 	}
 	st, err := store.Open(s.Dir, dek, s.AllowRollback)
 	if err != nil {
 		return err
 	}
 	s.kf, s.dek, s.st = kf, dek, st
-	msg := "vault unlocked"
-	if created {
-		msg = "new vault created"
-	}
+	s.Log.Attach(st.AddEvent)
 	s.Log.Emit(events.Event{Level: events.LevelOK, Action: "unlock", Actor: "human", Msg: msg})
 	return nil
 }
@@ -106,9 +134,12 @@ func (s *Server) Unlocked() bool {
 	return s.st != nil
 }
 
-// Serve listens on the Unix socket until ctx is cancelled.
-func (s *Server) Serve(ctx context.Context) error {
+// Listen creates the Unix socket. Call Serve next.
+func (s *Server) Listen() error {
 	sock := SocketPath(s.Dir)
+	if len(sock) > 103 {
+		return fmt.Errorf("socket path too long for macOS (%d > 103 bytes): %s; set AGPASS_DIR to a shorter directory", len(sock), sock)
+	}
 	if c, err := net.Dial("unix", sock); err == nil {
 		c.Close()
 		return fmt.Errorf("agpass is already running (%s)", sock)
@@ -122,26 +153,57 @@ func (s *Server) Serve(ctx context.Context) error {
 		ln.Close()
 		return err
 	}
+	s.ln = ln
+	return nil
+}
+
+// Serve answers requests on the socket from Listen until ctx is cancelled.
+func (s *Server) Serve(ctx context.Context) error {
+	sock, ln := SocketPath(s.Dir), s.ln
+	// Requests run on reqCtx, which is cancelled if they don't finish within
+	// the grace period after shutdown starts (e.g. a slow LLM call).
+	reqCtx, cancelReqs := context.WithCancel(context.Background())
+	defer cancelReqs()
 	srv := &http.Server{
 		Handler:           s.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return reqCtx },
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			pid, err := peer.PeerPID(c)
 			return context.WithValue(ctx, peerKey{}, peerInfo{pid, err})
 		},
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer close(shutdownDone)
+		select {
+		case <-ctx.Done():
+		case <-reqCtx.Done(): // Serve failed on its own
+			return
+		}
+		s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "shutdown", Msg: "waiting for running requests"})
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		srv.Shutdown(sctx)
+		if srv.Shutdown(sctx) != nil {
+			cancelReqs() // grace period over: abort what is still running
+		}
 	}()
 	s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "listen", Target: sock, Msg: "agpass " + api.Version})
-	err = srv.Serve(ln)
+	err := srv.Serve(ln)
+	if !errors.Is(err, http.ErrServerClosed) {
+		cancelReqs()
+	}
+	<-shutdownDone
+	s.inflight.Wait() // handlers may still be running after Shutdown returns
 	os.Remove(sock)
+	s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "stopped", Msg: "agpass server stopped"})
+	s.Log.Detach()
+	s.mu.Lock()
 	if s.st != nil {
 		s.st.Close()
+		s.st = nil
 	}
+	s.mu.Unlock()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -200,6 +262,8 @@ type handlerFunc func(r *http.Request, c *caller) (any, error)
 
 func (s *Server) handle(mode authMode, h handlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		s.inflight.Add(1)
+		defer s.inflight.Done()
 		w.Header().Set(api.HeaderVersion, api.Version)
 		c, err := s.authenticate(r, mode)
 		var out any
@@ -224,7 +288,7 @@ func (s *Server) authenticate(r *http.Request, mode authMode) (*caller, error) {
 		return &caller{}, nil
 	}
 	if !s.Unlocked() {
-		return nil, errf(http.StatusServiceUnavailable, api.ErrLocked, "agpass is locked: run `agpass unlock`")
+		return nil, errf(http.StatusServiceUnavailable, api.ErrLocked, "agpass is starting up; try again in a moment")
 	}
 	if pw := r.Header.Get(api.HeaderMaster); pw != "" {
 		if err := s.checkMaster(pw); err != nil {
@@ -261,6 +325,8 @@ func (s *Server) authenticate(r *http.Request, mode authMode) (*caller, error) {
 }
 
 func (s *Server) checkMaster(pw string) error {
+	s.masterMu.Lock()
+	defer s.masterMu.Unlock()
 	s.mu.Lock()
 	now := time.Now()
 	if now.Before(s.adminLock) {
@@ -337,8 +403,10 @@ func (s *Server) mintCode() api.MintResponse {
 	return api.MintResponse{Code: code, ExpiresAt: exp}
 }
 
-// redeemCode consumes code. Repeated failures invalidate all outstanding codes.
-func (s *Server) redeemCode(code string) error {
+// redeemCode consumes code and returns a func that puts it back, for when
+// the session can't be created after all. Repeated failures invalidate all
+// outstanding codes.
+func (s *Server) redeemCode(code string) (restore func(), err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h := codeHash(code)
@@ -346,7 +414,11 @@ func (s *Server) redeemCode(code string) error {
 	if ok {
 		delete(s.otps, h)
 		if time.Now().Before(exp) {
-			return nil
+			return func() {
+				s.mu.Lock()
+				s.otps[h] = exp
+				s.mu.Unlock()
+			}, nil
 		}
 	}
 	s.codeFails = recent(append(s.codeFails, time.Now()), failWindow)
@@ -355,7 +427,7 @@ func (s *Server) redeemCode(code string) error {
 		s.codeFails = nil
 		go s.Log.Emit(events.Event{Level: events.LevelAlert, Action: "code-lockout", Msg: "too many invalid connect codes; all outstanding codes revoked"})
 	}
-	return errf(http.StatusUnauthorized, api.ErrForbidden, "invalid, expired or already used code")
+	return nil, errf(http.StatusUnauthorized, api.ErrForbidden, "invalid, expired or already used code")
 }
 
 // ---- helpers ----
@@ -378,7 +450,59 @@ func decode(r *http.Request, v any) error {
 }
 
 func randomID(prefix string) string {
-	b := make([]byte, 4)
+	b := make([]byte, 8)
 	rand.Read(b)
 	return prefix + hex.EncodeToString(b)
+}
+
+// ---- dashboard ----
+
+// History returns the last n audit events from the store.
+func (s *Server) History(n int) ([]events.Event, error) {
+	s.mu.Lock()
+	st := s.st
+	s.mu.Unlock()
+	if st == nil {
+		return nil, nil
+	}
+	return st.RecentEvents(n)
+}
+
+// Status summarizes the vault for the dashboard header.
+type Status struct {
+	Folders, Items     int
+	Sessions, LiveSess int
+	Codes              int
+}
+
+func (s *Server) Status() (Status, error) {
+	s.mu.Lock()
+	st := s.st
+	codes := 0
+	for _, exp := range s.otps {
+		if time.Now().Before(exp) {
+			codes++
+		}
+	}
+	s.mu.Unlock()
+	out := Status{Codes: codes}
+	if st == nil {
+		return out, nil
+	}
+	c, err := st.Counts()
+	if err != nil {
+		return out, err
+	}
+	out.Folders, out.Items = c.Folders, c.Items
+	sessions, err := st.Sessions()
+	if err != nil {
+		return out, err
+	}
+	out.Sessions = len(sessions)
+	for _, sess := range sessions {
+		if p, err := peer.Info(sess.PID); err == nil && p.StartUS == sess.StartUS {
+			out.LiveSess++
+		}
+	}
+	return out, nil
 }

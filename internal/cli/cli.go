@@ -22,6 +22,7 @@ import (
 
 	"agpass/internal/api"
 	"agpass/internal/client"
+	"agpass/internal/dashboard"
 	"agpass/internal/events"
 	"agpass/internal/server"
 	"agpass/internal/vault"
@@ -30,10 +31,9 @@ import (
 const usage = `agpass — local secrets broker for AI agents
 
 Human:
-  agpass serve                     run the server in a terminal tab (asks for the master password)
-  agpass unlock                    unlock a server started without a terminal
+  agpass serve                     run the server in a terminal tab: asks for the master
+                                   password, then shows the live event log
   agpass mint                      create a one-time code that connects one agent session
-  agpass log [-f] [-n 50]          show the event log
   Any command below also works for the human: it asks for the master password
   (or pass --admin).
 
@@ -52,7 +52,7 @@ Agent (run inside Claude Code):
   agpass folder create NAME --project P [--desc D] [--repo github.com/org/repo]
   agpass folder edit NAME [--project P] [--desc D] [--repo R ...]
 
-Environment: AGPASS_DIR (default ~/.agpass)
+Data: $AGPASS_DIR, else $XDG_DATA_HOME/agpass, else ~/.local/share/agpass
 `
 
 func Run(args []string) int {
@@ -88,7 +88,6 @@ var commands map[string]func([]string) error
 func init() {
 	commands = map[string]func([]string) error{
 		"serve":          cmdServe,
-		"unlock":         cmdUnlock,
 		"mint":           cmdMint,
 		"connect":        cmdConnect,
 		"whoami":         cmdWhoami,
@@ -99,19 +98,23 @@ func init() {
 		"set":            cmdSet,
 		"folder create":  cmdFolderCreate,
 		"folder edit":    cmdFolderEdit,
-		"log":            cmdLog,
 		"version":        func([]string) error { fmt.Println("agpass", api.Version); return nil },
 	}
 }
 
 // ---- shared helpers ----
 
+// dataDir is $AGPASS_DIR, else $XDG_DATA_HOME/agpass, else
+// ~/.local/share/agpass.
 func dataDir() string {
 	if d := os.Getenv("AGPASS_DIR"); d != "" {
 		return d
 	}
+	if d := os.Getenv("XDG_DATA_HOME"); filepath.IsAbs(d) {
+		return filepath.Join(d, "agpass")
+	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".agpass")
+	return filepath.Join(home, ".local", "share", "agpass")
 }
 
 func flags(name string) (*pflag.FlagSet, *bool) {
@@ -172,6 +175,10 @@ func readPassword(prompt string) (string, error) {
 	return strings.TrimRight(line, "\r\n"), nil
 }
 
+// clean escapes control characters in text that may come from agents.
+// Raw output (--field, --json) is left untouched for pipes.
+func clean(s string) string { return events.Clean(s) }
+
 func printJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -187,7 +194,7 @@ func cwd() string { d, _ := os.Getwd(); return d }
 func cmdServe(args []string) error {
 	fs := pflag.NewFlagSet("serve", pflag.ContinueOnError)
 	rollback := fs.Bool("accept-rollback", false, "open a database older than the last one seen")
-	pwStdin := fs.Bool("password-stdin", false, "read the master password from stdin")
+	pwStdin := fs.Bool("password-stdin", false, "read the master password from stdin (no dashboard; log lines on stdout)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -197,39 +204,44 @@ func cmdServe(args []string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	log, err := events.Open(server.EventsPath(dir), os.Stdout, color())
-	if err != nil {
-		return err
+	interactive := !*pwStdin && isTTY(os.Stdin) && isTTY(os.Stdout)
+	if !interactive && !*pwStdin {
+		return fmt.Errorf("run `agpass serve` in a terminal, or pass --password-stdin")
 	}
-	defer log.Close()
+	// The dashboard shows events itself; without it, print them as lines.
+	log := events.New(nil, false)
+	if !interactive {
+		log.SetOutput(os.Stdout, color())
+	}
 	srv := server.New(dir, log)
 	srv.AllowRollback = *rollback
 
-	fmt.Printf("agpass %s · %s\n", api.Version, dir)
+	fmt.Printf("agpass %s · %s\n", api.Version, tildePath(dir))
 	newVault := !vault.Exists(server.KeyPath(dir))
 	switch {
-	case isTTY(os.Stdin):
-		if newVault {
-			fmt.Println("No vault yet — choose a master password (it cannot be recovered).")
-			pw, err := readPassword("New master password: ")
-			if err != nil {
-				return err
-			}
-			if len(pw) < 10 {
-				return fmt.Errorf("use at least 10 characters")
-			}
-			again, err := readPassword("Repeat: ")
-			if err != nil {
-				return err
-			}
-			if pw != again {
-				return fmt.Errorf("passwords do not match")
-			}
-			if err := srv.Unlock(pw); err != nil {
-				return err
-			}
-			break
+	case newVault && interactive:
+		fmt.Println("No vault yet — choose a master password (it cannot be recovered).")
+		pw, err := readPassword("New master password: ")
+		if err != nil {
+			return err
 		}
+		if len(pw) < server.MinPasswordLen {
+			return fmt.Errorf("use at least %d characters", server.MinPasswordLen)
+		}
+		again, err := readPassword("Repeat: ")
+		if err != nil {
+			return err
+		}
+		if pw != again {
+			return fmt.Errorf("passwords do not match")
+		}
+		if err := srv.Create(pw); err != nil {
+			return err
+		}
+	case newVault:
+		// Creating a vault needs the password typed twice at a terminal.
+		return fmt.Errorf("no vault in %s yet: run `agpass serve` in a terminal to create one", dir)
+	case interactive:
 		for tries := 0; ; tries++ {
 			pw, err := readPassword("Master password: ")
 			if err != nil {
@@ -244,7 +256,7 @@ func cmdServe(args []string) error {
 			}
 			fmt.Println("Wrong password.")
 		}
-	case *pwStdin:
+	default:
 		pw, err := readPassword("")
 		if err != nil {
 			return err
@@ -252,26 +264,54 @@ func cmdServe(args []string) error {
 		if err := srv.Unlock(pw); err != nil {
 			return err
 		}
-	default:
-		fmt.Println("No terminal: starting locked — run `agpass unlock`.")
+	}
+	if err := srv.Listen(); err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return srv.Serve(ctx)
+	if !interactive {
+		return srv.Serve(ctx)
+	}
+
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(sctx) }()
+	derr := dashboard.Run(sctx, dashboard.Source{
+		Title:   fmt.Sprintf("agpass %s · %s", api.Version, tildePath(dir)),
+		Log:     log,
+		History: func() ([]events.Event, error) { return srv.History(5000) },
+		Status:  func() string { return statusLine(srv) },
+	})
+	// Back on the normal screen: show the shutdown as plain lines.
+	log.SetOutput(os.Stdout, color())
+	cancel()
+	serr := <-served
+	if derr != nil {
+		return derr
+	}
+	return serr
 }
 
-func cmdUnlock(args []string) error {
-	pw, err := readPassword("Master password: ")
+func statusLine(srv *server.Server) string {
+	st, err := srv.Status()
 	if err != nil {
-		return err
+		return "status unavailable: " + err.Error()
 	}
-	c := client.New(server.SocketPath(dataDir()))
-	if err := c.Do("POST", "/v1/unlock", nil, api.UnlockRequest{Password: pw}, nil); err != nil {
-		return err
+	s := fmt.Sprintf("● serving · %d live sessions (%d total) · %d folders · %d items", st.LiveSess, st.Sessions, st.Folders, st.Items)
+	if st.Codes > 0 {
+		s += fmt.Sprintf(" · %d unused codes", st.Codes)
 	}
-	fmt.Println("Unlocked.")
-	return nil
+	return s
+}
+
+func tildePath(p string) string {
+	if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(p, home+"/") {
+		return "~" + p[len(home):]
+	}
+	return p
 }
 
 func cmdMint(args []string) error {
@@ -290,16 +330,6 @@ func cmdMint(args []string) error {
 	fmt.Printf("Connect code: %s  (single use, valid until %s)\n\n", m.Code, m.ExpiresAt.Local().Format("15:04"))
 	fmt.Printf("Tell your agent:\n  connect to agpass with `agpass connect %s`\n", m.Code)
 	return nil
-}
-
-func cmdLog(args []string) error {
-	fs := pflag.NewFlagSet("log", pflag.ContinueOnError)
-	follow := fs.BoolP("follow", "f", false, "keep printing new events")
-	n := fs.IntP("lines", "n", 50, "number of past events to show (0 = all)")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	return events.Tail(server.EventsPath(dataDir()), *n, *follow, os.Stdout, color())
 }
 
 // ---- agent session ----
@@ -350,7 +380,7 @@ func cmdWhoami(args []string) error {
 	s := w.Session
 	fmt.Printf("session %s · %s pid %d · since %s\n", s.ID, s.Agent, s.PID, s.CreatedAt.Local().Format("2006-01-02 15:04"))
 	if s.Repo != "" || s.Cwd != "" {
-		fmt.Printf("repo %s · cwd %s\n", s.Repo, s.Cwd)
+		fmt.Printf("repo %s · cwd %s\n", clean(s.Repo), clean(s.Cwd))
 	}
 	printGrants(s.Grants)
 	return nil
@@ -363,7 +393,7 @@ func printGrants(gs []api.Grant) {
 	}
 	fmt.Println("Folders:")
 	for _, g := range gs {
-		fmt.Printf("  %-20s %s\n", g.Folder, g.By)
+		fmt.Printf("  %-20s %s\n", clean(g.Folder), clean(g.By))
 	}
 }
 
@@ -390,16 +420,16 @@ func cmdRequestAccess(args []string) error {
 		return printJSON(resp)
 	}
 	for _, g := range resp.Granted {
-		fmt.Printf("granted  %-20s (%s)\n", g.Folder, g.By)
+		fmt.Printf("granted  %-20s (%s)\n", clean(g.Folder), clean(g.By))
 	}
 	for _, d := range resp.Denied {
-		fmt.Printf("denied   %s\n", d)
+		fmt.Printf("denied   %s\n", clean(d))
 	}
 	if len(resp.Granted) == 0 && len(resp.Denied) == 0 {
 		fmt.Println("No new folders granted.")
 	}
 	if resp.Explanation != "" {
-		fmt.Println("\n" + resp.Explanation)
+		fmt.Println("\n" + clean(resp.Explanation))
 	}
 	fmt.Println()
 	printGrants(resp.Session.Grants)
@@ -433,13 +463,13 @@ func cmdList(args []string) error {
 		if i > 0 {
 			fmt.Println()
 		}
-		fmt.Printf("%s  (project: %s)", f.Name, f.Project)
+		fmt.Printf("%s  (project: %s)", clean(f.Name), clean(f.Project))
 		if len(f.Repos) > 0 {
-			fmt.Printf("  repos: %s", strings.Join(f.Repos, ", "))
+			fmt.Printf("  repos: %s", clean(strings.Join(f.Repos, ", ")))
 		}
 		fmt.Println()
 		if f.Description != "" {
-			fmt.Printf("  %s\n", f.Description)
+			fmt.Printf("  %s\n", clean(f.Description))
 		}
 		if len(f.Items) == 0 {
 			fmt.Println("  (no items)")
@@ -459,7 +489,7 @@ func cmdList(args []string) error {
 	if len(resp.Others) > 0 {
 		var names []string
 		for _, o := range resp.Others {
-			names = append(names, fmt.Sprintf("%s (%s)", o.Name, o.Project))
+			names = append(names, fmt.Sprintf("%s (%s)", clean(o.Name), clean(o.Project)))
 		}
 		fmt.Printf("\nOther folders (use request-access): %s\n", strings.Join(names, ", "))
 	}
@@ -504,10 +534,10 @@ func cmdGet(args []string) error {
 	if *asJSON {
 		return printJSON(it)
 	}
-	fmt.Printf("%s/%s  v%d · updated %s by %s\n", it.Folder, it.Name, it.Version, it.UpdatedAt.Local().Format("2006-01-02 15:04"), it.UpdatedBy)
+	fmt.Printf("%s/%s  v%d · updated %s by %s\n", it.Folder, it.Name, it.Version, it.UpdatedAt.Local().Format("2006-01-02 15:04"), clean(it.UpdatedBy))
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	for _, f := range it.Fields {
-		fmt.Fprintf(tw, "  %s\t%s\t%s\n", f.Key, f.Type, f.Value)
+		fmt.Fprintf(tw, "  %s\t%s\t%s\n", f.Key, clean(f.Type), clean(f.Value))
 	}
 	return tw.Flush()
 }

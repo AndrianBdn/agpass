@@ -3,14 +3,13 @@
 package events
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -30,35 +29,91 @@ type Event struct {
 	Msg    string    `json:"msg,omitempty"`
 }
 
+// Log fans events out to the store (once the vault is open), an optional
+// plain-text writer, and subscribers such as the dashboard. Events emitted
+// before the store is attached are kept and written when it is.
 type Log struct {
-	mu    sync.Mutex
-	f     *os.File
-	out   io.Writer
-	color bool
+	mu      sync.Mutex
+	persist func(Event) error
+	pending []Event
+	subs    map[chan Event]struct{}
+	out     io.Writer
+	color   bool
 }
 
-func Open(path string, out io.Writer, color bool) (*Log, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	return &Log{f: f, out: out, color: color}, nil
+const maxPending = 1000
+
+// New returns a log that also prints each event to out (nil: don't print).
+func New(out io.Writer, color bool) *Log {
+	return &Log{out: out, color: color, subs: map[chan Event]struct{}{}}
 }
 
 func (l *Log) Emit(e Event) {
 	if e.Time.IsZero() {
 		e.Time = time.Now()
 	}
-	b, _ := json.Marshal(e)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.f.Write(append(b, '\n'))
+	if l.persist == nil || l.persist(e) != nil {
+		if len(l.pending) < maxPending {
+			l.pending = append(l.pending, e)
+		}
+	}
 	if l.out != nil {
 		fmt.Fprintln(l.out, Format(e, l.color))
 	}
+	for ch := range l.subs {
+		select {
+		case ch <- e:
+		default: // subscriber is behind; it still has the store for history
+		}
+	}
 }
 
-func (l *Log) Close() error { return l.f.Close() }
+// Attach starts persisting events with persist, after writing the ones
+// emitted so far.
+func (l *Log) Attach(persist func(Event) error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	kept := l.pending[:0]
+	for _, e := range l.pending {
+		if persist(e) != nil {
+			kept = append(kept, e)
+		}
+	}
+	l.pending, l.persist = kept, persist
+}
+
+// Detach stops persisting (before the store closes).
+func (l *Log) Detach() {
+	l.mu.Lock()
+	l.persist = nil
+	l.mu.Unlock()
+}
+
+// SetOutput changes where events are printed (nil: nowhere).
+func (l *Log) SetOutput(out io.Writer, color bool) {
+	l.mu.Lock()
+	l.out, l.color = out, color
+	l.mu.Unlock()
+}
+
+// Subscribe returns history() and a channel of every event emitted after it,
+// with nothing lost or repeated in between. cancel stops the subscription.
+func (l *Log) Subscribe(history func() ([]Event, error)) (past []Event, ch <-chan Event, cancel func(), err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if past, err = history(); err != nil {
+		return nil, nil, nil, err
+	}
+	c := make(chan Event, 4096)
+	l.subs[c] = struct{}{}
+	return past, c, func() {
+		l.mu.Lock()
+		delete(l.subs, c)
+		l.mu.Unlock()
+	}, nil
+}
 
 const (
 	reset   = "\x1b[0m"
@@ -80,8 +135,10 @@ var levelStyle = map[string][2]string{
 	LevelAlert: {"‼", bold + red},
 }
 
-// Format renders one event as a single readable line.
+// Format renders one event as a single readable line. Fields are cleaned:
+// they carry text written by agents.
 func Format(e Event, color bool) string {
+	e.Action, e.Actor, e.Target, e.Msg = Clean(e.Action), Clean(e.Actor), Clean(e.Target), Clean(e.Msg)
 	st, ok := levelStyle[e.Level]
 	if !ok {
 		st = [2]string{"·", ""}
@@ -109,53 +166,36 @@ func Format(e Event, color bool) string {
 	return b.String()
 }
 
-// Tail prints the last n events of path, then keeps following if follow.
-func Tail(path string, n int, follow bool, w io.Writer, color bool) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	r := bufio.NewReader(f)
-	var lines []string
-	var partial string
-	for {
-		line, err := r.ReadString('\n')
-		if err == io.EOF {
-			partial = line
+// Clean makes text safe to print on a terminal: control characters
+// (including ESC, CR and newlines) and bidirectional overrides are shown as
+// escapes instead of being interpreted, so agent-written text can't move the
+// cursor, recolor, erase or fake lines.
+func Clean(s string) string {
+	clean := true
+	for _, r := range s {
+		if unsafeRune(r) {
+			clean = false
 			break
 		}
-		if err != nil {
-			return err
-		}
-		lines = append(lines, line)
-		if n > 0 && len(lines) > n {
-			lines = lines[1:]
-		}
 	}
-	print := func(line string) {
-		var e Event
-		if json.Unmarshal([]byte(line), &e) == nil {
-			fmt.Fprintln(w, Format(e, color))
-		}
+	if clean {
+		return s
 	}
-	for _, l := range lines {
-		print(l)
-	}
-	if !follow {
-		return nil
-	}
-	for {
-		line, err := r.ReadString('\n')
-		partial += line
-		if err == io.EOF {
-			time.Sleep(300 * time.Millisecond)
+	var b strings.Builder
+	for _, r := range s {
+		if unsafeRune(r) {
+			if r <= 0xff {
+				fmt.Fprintf(&b, `\x%02x`, r)
+			} else {
+				fmt.Fprintf(&b, `\u%04x`, r)
+			}
 			continue
 		}
-		if err != nil {
-			return err
-		}
-		print(partial)
-		partial = ""
+		b.WriteRune(r)
 	}
+	return b.String()
+}
+
+func unsafeRune(r rune) bool {
+	return unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r) || r == utf8.RuneError
 }

@@ -18,6 +18,9 @@ func TestString(t *testing.T) {
 		"https://api.example.com/v1?api_key=abc123&x=1":        "https://api.example.com/v1?api_key=" + R + "&x=1",
 		"redis://:hunter2@cache:6379/0":                        "redis://:" + R + "@cache:6379/0",
 		"DATABASE_URL=mysql://root:toor@localhost/db and more": "DATABASE_URL=mysql://root:" + R + "@localhost/db and more",
+		"postgres://app:p@ss@db/crm":                           "postgres://app:" + R + "@db/crm",
+		"postgres://app:p@ss@w@db/crm sslmode=x":               "postgres://app:" + R + "@db/crm sslmode=x",
+		"mongodb://u:pw@h1,h2/db?replicaSet=rs&email=a@b.c":    "mongodb://u:" + R + "@b.c",
 		"plain text": "plain text",
 	}
 	for in, want := range cases {
