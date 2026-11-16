@@ -8,7 +8,7 @@ with a one-time code.
 ## Install
 
 ```sh
-make install          # builds, signs with hardened runtime, installs to ~/.local/bin
+make install          # builds, signs with hardened runtime, installs to ~/.local/bin, links the skill
 ```
 
 ## Use
@@ -40,17 +40,11 @@ Then tell Claude: *connect to agpass with `agpass connect agp-k7m2-x9qd`*.
 
 ## Instructions for agents
 
-Paste into `~/.claude/CLAUDE.md`:
-
-```markdown
-## Secrets: agpass
-Secrets live in agpass, not in .env files. Run `agpass help` for commands.
-- If agpass says the session is not connected, ask the user to run `agpass mint` and give you the code, then `agpass connect <code>`.
-- Before using secrets, run `agpass request-access --reason "<what you are working on and why>"` from the repo.
-- `agpass get folder/item` shows values redacted. To use a value, pipe it without printing:
-  `psql "$(agpass get crm/db --reveal --field url)"`, or `agpass get crm/db --reveal --json | jq ...`.
-- Never print, log or commit revealed values.
-```
+`make install` also links the Claude Code skill
+[`.claude/skills/agpass`](.claude/skills/agpass/SKILL.md) into
+`~/.claude/skills/agpass` (or run `make install-skill`). Claude loads it whenever
+a task needs a credential. It covers connecting, requesting access, using
+secrets without printing them, and storing new ones.
 
 ## How it works
 
