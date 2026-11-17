@@ -191,12 +191,30 @@ func (m *model) add(e events.Event) {
 }
 
 func (m *model) onEvent(e events.Event) {
+	newDay := m.lastDay() != dayOf(e)
 	m.add(e)
 	if m.scroll > 0 && m.matches(e) {
-		m.scroll++ // keep the view still while the user reads history
+		// Keep the view still while the user reads history: shift by the
+		// lines this event adds, including a new day's rule.
+		m.scroll++
+		if newDay {
+			m.scroll++
+		}
 		m.unseen++
 	}
 }
+
+// lastDay is the day of the newest event that render would show.
+func (m *model) lastDay() string {
+	for i := len(m.all) - 1; i >= 0; i-- {
+		if m.matches(m.all[i]) {
+			return dayOf(m.all[i])
+		}
+	}
+	return ""
+}
+
+func dayOf(e events.Event) string { return e.Time.Local().Format("Mon 2 Jan 2006") }
 
 // key handles one key and reports whether to quit.
 func (m *model) key(k string) bool {
@@ -336,7 +354,7 @@ func (m *model) render() []string {
 		if !m.matches(e) {
 			continue
 		}
-		if d := e.Time.Local().Format("Mon 2 Jan 2006"); d != day {
+		if d := dayOf(e); d != day {
 			day = d
 			out = append(out, style(faint, "── "+d+" ──"))
 		}

@@ -8,7 +8,9 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -182,5 +184,62 @@ func TestSSHAgentWithOpenSSH(t *testing.T) {
 	}
 	if signed != 1 || denied < 1 {
 		t.Fatalf("want 1 signature for %s and a denial, got signed=%d denied=%d: %+v", allowed, signed, denied, logged)
+	}
+}
+
+// Concurrent grants all rewrite known_hosts; every write must succeed and the
+// file must end up complete, with no stray temp files.
+func TestKnownHostsConcurrentWrites(t *testing.T) {
+	dir := t.TempDir()
+	const pw = "correct-horse-1"
+	if _, err := vault.Create(KeyPath(dir), pw); err != nil {
+		t.Fatal(err)
+	}
+	s := New(dir, events.New(nil, false))
+	if err := s.Unlock(pw); err != nil {
+		t.Fatal(err)
+	}
+	defer s.st.Close()
+	_, authorized, err := sshagent.Generate("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 30
+	for i := range n {
+		if err := s.st.PinHostKeys(fmt.Sprintf("h%d.example", i), []string{authorized}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const writers = 200
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make(chan error, writers)
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- s.writeKnownHosts()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := os.ReadFile(KnownHostsPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range n {
+		if !strings.Contains(string(b), fmt.Sprintf("\nh%d.example ", i)) {
+			t.Errorf("known_hosts is missing h%d.example", i)
+		}
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".known_hosts-*")); len(left) > 0 {
+		t.Errorf("temp files left behind: %v", left)
 	}
 }

@@ -35,8 +35,12 @@ func AgentSocketPath(dir string) string { return filepath.Join(dir, "agent.sock"
 // `agpass ssh command` (UserKnownHostsFile with strict checking).
 func KnownHostsPath(dir string) string { return filepath.Join(dir, "known_hosts") }
 
-// writeKnownHosts rewrites the known_hosts file from the pinned keys.
+// writeKnownHosts rewrites the known_hosts file from the pinned keys. It
+// holds a lock across reading the keys and replacing the file, so concurrent
+// grants can't interleave or leave an older snapshot in place.
 func (s *Server) writeKnownHosts() error {
+	s.agent.khMu.Lock()
+	defer s.agent.khMu.Unlock()
 	pairs, err := s.st.AllHostKeys()
 	if err != nil {
 		return err
@@ -50,17 +54,26 @@ func (s *Server) writeKnownHosts() error {
 		}
 		b.WriteString(host + " " + p[1] + "\n")
 	}
-	tmp := KnownHostsPath(s.Dir) + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o600); err != nil {
+	f, err := os.CreateTemp(s.Dir, ".known_hosts-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, KnownHostsPath(s.Dir))
+	defer os.Remove(f.Name()) // no-op after a successful rename
+	if _, err := f.WriteString(b.String()); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), KnownHostsPath(s.Dir))
 }
 
 type agentState struct {
 	mu    sync.Mutex
 	ln    net.Listener
 	conns map[net.Conn]struct{}
+	khMu  sync.Mutex // serializes writeKnownHosts
 }
 
 func (s *Server) listenAgent() error {
@@ -451,10 +464,12 @@ func (s *Server) pinHost(ctx context.Context, c *caller, host string) ([]string,
 		if err := s.st.PinHostKeys(host, keys); err != nil {
 			return nil, err
 		}
-		if err := s.writeKnownHosts(); err != nil {
-			return nil, err
-		}
 		s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "ssh-pin", Actor: c.String(), Target: host, Msg: fmt.Sprintf("pinned %d host keys", len(keys))})
+	}
+	// Rewrite on every grant, not just new pins, so a file that lost a host
+	// (or was edited) heals on the next allow.
+	if err := s.writeKnownHosts(); err != nil {
+		return nil, err
 	}
 	var fps []string
 	for _, k := range keys {
