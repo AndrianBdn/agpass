@@ -11,11 +11,13 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/pflag"
 
 	"agpass/internal/config"
+	"agpass/internal/peer"
 	"agpass/internal/server"
 	"agpass/internal/vault"
 )
@@ -28,18 +30,23 @@ func addManualFlag(fs *pflag.FlagSet) {
 	fs.BoolVar(&manualPassword, "manual", false, "type the master password instead of reading it from 1Password")
 }
 
-// onePasswordConfig is the [onepassword] config, empty with --manual.
+// onePasswordConfig is the [onepassword] config, empty with --manual. It is
+// read once per command, so every step uses the same one.
 func onePasswordConfig() (config.OnePassword, error) {
 	if manualPassword {
 		return config.OnePassword{}, nil
 	}
-	cfg, err := config.Load(config.Path())
-	return cfg.OnePassword, err
+	opConfig.once.Do(func() {
+		cfg, err := config.Load(config.Path())
+		opConfig.c, opConfig.err = cfg.OnePassword, err
+	})
+	return opConfig.c, opConfig.err
 }
 
-func onePasswordSet() bool {
-	c, err := onePasswordConfig()
-	return err == nil && c.MasterPassword != ""
+var opConfig struct {
+	once sync.Once
+	c    config.OnePassword
+	err  error
 }
 
 // masterPassword gets the master password: from 1Password when configured
@@ -47,11 +54,21 @@ func onePasswordSet() bool {
 // asks instead. fromOP says where the password came from.
 func masterPassword() (pw string, fromOP bool, err error) {
 	op, err := onePasswordConfig()
-	if err != nil {
-		return "", false, err
+	blocked := ""
+	if err == nil && op.MasterPassword != "" {
+		blocked = opBlocked()
 	}
-	if op.MasterPassword != "" {
-		fmt.Fprintf(os.Stderr, "Reading the master password from 1Password (%s)…\n", op.MasterPassword)
+	switch {
+	case err != nil && !isTTY(os.Stdin):
+		return "", false, err
+	case err != nil: // a broken config (agents can write it) must not lock the human out
+		fmt.Fprintf(os.Stderr, "%v\nType the master password instead (agpass setup can fix the config).\n", err)
+	case blocked != "" && !isTTY(os.Stdin):
+		return "", false, errors.New(blocked)
+	case blocked != "":
+		fmt.Fprintln(os.Stderr, blocked+" Type the master password instead.")
+	case op.MasterPassword != "":
+		fmt.Fprintf(os.Stderr, "Reading the master password from 1Password (%s)…\n", clean(op.MasterPassword))
 		pw, err := opMasterPassword(context.Background(), op)
 		if err == nil {
 			return pw, true, nil
@@ -65,13 +82,55 @@ func masterPassword() (pw string, fromOP bool, err error) {
 	return pw, false, err
 }
 
-// nextMasterPassword is masterPassword for the first try and typed after.
-func nextMasterPassword(try int) (string, bool, error) {
-	if try == 0 {
-		return masterPassword()
+// agentAncestor names the agent (e.g. "claude") this process runs under, or
+// "" when none; tests replace it.
+var agentAncestor = func() (string, error) {
+	_, a, err := peer.NewResolver().FindAgent(os.Getpid())
+	if errors.Is(err, peer.ErrNoAgent) {
+		return "", nil
 	}
-	pw, err := readPassword("Master password: ")
-	return pw, false, err
+	return a.Name, err
+}
+
+// opBlocked says why this process may not run op, or "" when it may. Never
+// under an agent: approving a 1Password prompt an agent started would leave
+// op unlocked in the agent's session, where it could read the master
+// password (and the rest of 1Password) itself.
+func opBlocked() string {
+	name, err := agentAncestor()
+	switch {
+	case err != nil:
+		return fmt.Sprintf("1Password is not used: cannot check whether an agent runs this command (%v).", err)
+	case name != "":
+		return fmt.Sprintf("1Password is not used for commands run under %s; run this in your own terminal.", name)
+	}
+	return ""
+}
+
+// withMasterPassword runs try with the master password, up to three times:
+// first from masterPassword (1Password or typed), then typed. try reports
+// whether the password was rejected.
+func withMasterPassword(try func(pw string) (wrong bool, err error)) error {
+	for n := 0; ; n++ {
+		var pw string
+		fromOP := false
+		var err error
+		if n == 0 {
+			pw, fromOP, err = masterPassword()
+		} else {
+			pw, err = readPassword("Master password: ")
+		}
+		if err != nil {
+			return err
+		}
+		wrong, err := try(pw)
+		if !wrong || n == 2 {
+			return err
+		}
+		if err := wrongPassword(fromOP); err != nil {
+			return err
+		}
+	}
 }
 
 // wrongPassword reports a rejected master password before the next try. A
@@ -81,11 +140,11 @@ func wrongPassword(fromOP bool) error {
 		fmt.Fprintln(os.Stderr, "Wrong password.")
 		return nil
 	}
-	op, _ := onePasswordConfig()
+	op, _ := onePasswordConfig() // loaded fine, or fromOP would be false
 	if !isTTY(os.Stdin) {
-		return fmt.Errorf("1Password: the password in %s is not the master password", op.MasterPassword)
+		return fmt.Errorf("1Password: the password in %s is not the master password", clean(op.MasterPassword))
 	}
-	fmt.Fprintf(os.Stderr, "1Password: the password in %s is not the master password. Type it instead.\n", op.MasterPassword)
+	fmt.Fprintf(os.Stderr, "1Password: the password in %s is not the master password. Type it instead.\n", clean(op.MasterPassword))
 	return nil
 }
 
@@ -93,19 +152,20 @@ func wrongPassword(fromOP bool) error {
 var opCommand = "op"
 
 // opArgs builds the op command line: `op read` for a secret reference,
-// `op item get` (password field) for an item name or ID.
+// `op item get` (password field, as JSON so op doesn't CSV-quote it) for an
+// item name or ID. "--" keeps a name starting with "-" from being a flag.
 func opArgs(c config.OnePassword) []string {
-	c.MasterPassword = unquote(c.MasterPassword) // also when pasted quoted into the config
+	ref := unquote(c.MasterPassword) // also when pasted quoted into the config
 	var args []string
-	if strings.HasPrefix(c.MasterPassword, "op://") {
-		args = []string{"read", "--no-newline", c.MasterPassword}
+	if strings.HasPrefix(ref, "op://") {
+		args = []string{"read", "--no-newline"}
 	} else {
-		args = []string{"item", "get", c.MasterPassword, "--fields", "label=password", "--reveal"}
+		args = []string{"item", "get", "--fields", "label=password", "--reveal", "--format", "json"}
 	}
 	if c.Account != "" {
 		args = append(args, "--account", c.Account)
 	}
-	return args
+	return append(args, "--", ref)
 }
 
 // opMasterPassword reads the master password with the 1Password CLI. op may
@@ -115,7 +175,8 @@ func opMasterPassword(ctx context.Context, c config.OnePassword) (string, error)
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute) // time to approve
 	defer cancel()
 	var out bytes.Buffer
-	cmd := exec.CommandContext(ctx, opCommand, opArgs(c)...)
+	args := opArgs(c)
+	cmd := exec.CommandContext(ctx, opCommand, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, &out, os.Stderr
 	if err := cmd.Run(); err != nil {
 		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
@@ -123,7 +184,18 @@ func opMasterPassword(ctx context.Context, c config.OnePassword) (string, error)
 		}
 		return "", fmt.Errorf("op failed: %w", err)
 	}
-	pw := strings.TrimSuffix(strings.TrimSuffix(out.String(), "\n"), "\r")
+	var pw string
+	if args[0] == "item" {
+		var field struct {
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &field); err != nil {
+			return "", fmt.Errorf("op item get: unexpected output: %w", err)
+		}
+		pw = field.Value
+	} else {
+		pw = strings.TrimSuffix(strings.TrimSuffix(out.String(), "\n"), "\r")
+	}
 	if pw == "" {
 		return "", fmt.Errorf("op returned an empty password for %q", c.MasterPassword)
 	}
@@ -143,7 +215,7 @@ func checkOnePassword(dir string, c config.OnePassword) error {
 		return err
 	}
 	if _, err := kf.Unwrap(pw); errors.Is(err, vault.ErrWrongPassword) {
-		return fmt.Errorf("the password in %s is not the master password of this vault", c.MasterPassword)
+		return fmt.Errorf("the password in %s is not the master password of this vault", clean(c.MasterPassword))
 	} else if err != nil {
 		return err
 	}
@@ -176,8 +248,15 @@ func opAccounts() ([]opAccount, error) {
 func setupOnePassword(dir string) error {
 	path := config.Path()
 	cfg, err := config.Load(path)
+	replacing := err != nil
 	if err != nil {
-		return err
+		// Don't let a broken file (an agent can write it) block setup: show
+		// it and offer to replace it.
+		fmt.Println(ui.bad("cannot read the config") + "\n  " + err.Error())
+		if !askYesNo("Replace it with a new 1Password setting?", false) {
+			return nil
+		}
+		cfg = config.Config{}
 	}
 	cur := cfg.OnePassword
 	if cur.MasterPassword != "" {
@@ -199,7 +278,7 @@ func setupOnePassword(dir string) error {
 			fmt.Println(ui.dim("The 1Password CLI (op) is not installed; skipped."))
 			return nil
 		}
-		if !askYesNo("Read the master password from 1Password?", false) {
+		if !replacing && !askYesNo("Read the master password from 1Password?", false) {
 			fmt.Println(ui.dim("Skipped. Run `agpass setup` again to set it up later."))
 			return nil
 		}
@@ -220,7 +299,7 @@ func setupOnePassword(dir string) error {
 		def := 1
 		fmt.Println("op is signed in to several 1Password accounts:")
 		for i, a := range accts {
-			fmt.Printf("  %d) %s  %s\n", i+1, a.URL, ui.dim(a.Email))
+			fmt.Printf("  %d) %s  %s\n", i+1, clean(a.URL), ui.dim(clean(a.Email)))
 			if a.URL == cur.Account {
 				def = i + 1
 			}
@@ -284,11 +363,13 @@ func unquote(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// describeOP shows the configured item. The config file is writable by
+// agents, so its text is escaped before it reaches the terminal.
 func describeOP(c config.OnePassword) string {
 	if c.Account != "" {
-		return c.MasterPassword + " (account " + c.Account + ")"
+		return clean(c.MasterPassword) + " (account " + clean(c.Account) + ")"
 	}
-	return c.MasterPassword
+	return clean(c.MasterPassword)
 }
 
 // readLine reads one line from the terminal or stdin, trimmed.

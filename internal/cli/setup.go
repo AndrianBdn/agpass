@@ -189,26 +189,17 @@ func openSetupVault(dir string) (setupVault, error) {
 type remoteVault struct{ c *client.Client }
 
 func openRemoteVault(sock string) (setupVault, error) {
-	for tries := 0; ; tries++ {
-		pw, fromOP, err := nextMasterPassword(tries)
-		if err != nil {
-			return nil, err
-		}
-		v := &remoteVault{c: client.New(sock)}
+	v := &remoteVault{c: client.New(sock)}
+	err := withMasterPassword(func(pw string) (bool, error) {
 		v.c.Master = pw
-		_, err = v.gatekeeperSet() // also checks the password
-		if err == nil {
-			fmt.Println(ui.ok("Unlocked."))
-			return v, nil
-		}
-		var ae *api.Error
-		if !errors.As(err, &ae) || ae.Code != api.ErrForbidden || tries == 2 {
-			return nil, err
-		}
-		if err := wrongPassword(fromOP); err != nil {
-			return nil, err
-		}
+		_, err := v.gatekeeperSet() // also checks the password
+		return apiCode(err) == api.ErrWrongMaster, err
+	})
+	if err != nil {
+		return nil, err
 	}
+	fmt.Println(ui.ok("Unlocked."))
+	return v, nil
 }
 
 func (v *remoteVault) gatekeeperSet() (bool, error) {
@@ -299,28 +290,21 @@ func openLocalVault(dir string) (setupVault, error) {
 	if err != nil {
 		return nil, err
 	}
-	for tries := 0; ; tries++ {
-		pw, fromOP, err := nextMasterPassword(tries)
-		if err != nil {
-			return nil, err
-		}
-		dek, err := kf.Unwrap(pw)
-		if errors.Is(err, vault.ErrWrongPassword) && tries < 2 {
-			if err := wrongPassword(fromOP); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		st, err := store.Open(dir, dek, false)
-		if err != nil {
-			return nil, err
-		}
-		fmt.Println(ui.ok("Unlocked."))
-		return &localVault{st: st, dir: dir}, nil
+	var dek []byte
+	err = withMasterPassword(func(pw string) (bool, error) {
+		var err error
+		dek, err = kf.Unwrap(pw)
+		return errors.Is(err, vault.ErrWrongPassword), err
+	})
+	if err != nil {
+		return nil, err
 	}
+	st, err := store.Open(dir, dek, false)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println(ui.ok("Unlocked."))
+	return &localVault{st: st, dir: dir}, nil
 }
 
 func (v *localVault) gatekeeperSet() (bool, error) {

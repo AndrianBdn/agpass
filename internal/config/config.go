@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"agpass/internal/events"
 )
 
 // Config is the config file.
@@ -52,12 +54,13 @@ func Load(path string) (Config, error) {
 		return Config{}, nil
 	}
 	if err != nil {
-		return Config{}, fmt.Errorf("config %s: %w", path, err)
+		// Agents can write this file: escape what the parser quotes from it.
+		return Config{}, fmt.Errorf("config %s: %s", path, events.Clean(err.Error()))
 	}
 	if un := md.Undecoded(); len(un) > 0 {
 		keys := make([]string, len(un))
 		for i, k := range un {
-			keys[i] = k.String()
+			keys[i] = events.Clean(k.String())
 		}
 		return Config{}, fmt.Errorf("config %s: unknown keys: %s", path, strings.Join(keys, ", "))
 	}

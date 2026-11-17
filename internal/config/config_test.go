@@ -44,3 +44,12 @@ func TestSaveLoad(t *testing.T) {
 		t.Errorf("mode %v", fi.Mode())
 	}
 }
+
+func TestLoadEscapesFileText(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(p, []byte("[onepassword]\n\"\\u001b[2Jx\" = 1\n"), 0o600)
+	_, err := Load(p)
+	if err == nil || strings.ContainsRune(err.Error(), 0x1b) {
+		t.Fatalf("unknown key not escaped: %q", err)
+	}
+}

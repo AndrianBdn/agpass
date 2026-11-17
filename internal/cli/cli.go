@@ -153,49 +153,40 @@ func flags(name string) (*pflag.FlagSet, *bool) {
 
 type conn struct {
 	*client.Client
-	fromOP bool // Master came from 1Password
+	login bool // send the master password from the first request on (--admin)
 }
 
 func newConn(admin bool) (*conn, error) {
-	c := &conn{Client: client.New(server.SocketPath(dataDir()))}
-	if admin {
-		if err := c.login(); err != nil {
-			return nil, err
-		}
-	}
-	return c, nil
+	return &conn{Client: client.New(server.SocketPath(dataDir())), login: admin}, nil
 }
 
-func (c *conn) login() error {
-	pw, fromOP, err := masterPassword()
-	if err != nil {
-		return err
-	}
-	c.Master, c.fromOP = pw, fromOP
-	return nil
-}
-
-// call retries with the master password when the server says the caller is
-// not an agent, and we can get it (1Password, or a human at a terminal); and
-// once more, typed, when the server rejects the one from 1Password.
+// call sends a request, with the master password when the command asked for
+// it (--admin, mint, ...). A request refused for not being an agent is
+// retried with the master password only for a human at a terminal, not for
+// a detached process.
 func (c *conn) call(method, path string, q url.Values, body, out any) error {
-	err := c.Do(method, path, q, body, out)
-	if c.Master == "" && apiCode(err) == api.ErrNeedAdmin && (isTTY(os.Stdin) || onePasswordSet()) {
-		if err := c.login(); err != nil {
-			return err
-		}
-		err = c.Do(method, path, q, body, out)
+	do := func() error { return c.Do(method, path, q, body, out) }
+	if c.login && c.Master == "" {
+		return c.withLogin(do)
 	}
-	if c.fromOP && isWrongMaster(err) {
-		if werr := wrongPassword(true); werr != nil {
-			return werr
-		}
-		pw, perr := readPassword("Master password: ")
-		if perr != nil {
-			return perr
-		}
-		c.Master, c.fromOP = pw, false
-		err = c.Do(method, path, q, body, out)
+	err := do()
+	if c.Master == "" && apiCode(err) == api.ErrNeedAdmin && isTTY(os.Stdin) {
+		return c.withLogin(do)
+	}
+	return err
+}
+
+// withLogin gets the master password (1Password or typed) and runs do with
+// it, retrying while the server says it is wrong.
+func (c *conn) withLogin(do func() error) error {
+	var last error
+	err := withMasterPassword(func(pw string) (bool, error) {
+		c.Master = pw
+		last = do()
+		return apiCode(last) == api.ErrWrongMaster, last
+	})
+	if err != nil {
+		c.Master = ""
 	}
 	return err
 }
@@ -206,10 +197,6 @@ func apiCode(err error) string {
 		return ae.Code
 	}
 	return ""
-}
-
-func isWrongMaster(err error) bool {
-	return apiCode(err) == api.ErrForbidden && strings.Contains(err.Error(), "wrong master password")
 }
 
 func isTTY(f *os.File) bool { return term.IsTerminal(int(f.Fd())) }
@@ -256,11 +243,6 @@ func cmdServe(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	op, err := onePasswordConfig()
-	if err != nil {
-		return err
-	}
-	onePassword := op.MasterPassword != "" && !*pwStdin
 	unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{}) // no core dumps of decrypted memory
 	// Libraries (net/http, the SSH agent) report errors through the standard
 	// logger; agpass reports through its event log, and stray lines would
@@ -272,6 +254,16 @@ func cmdServe(args []string) error {
 		return err
 	}
 	interactive := !*pwStdin && isTTY(os.Stdin) && isTTY(os.Stdout)
+	onePassword := false
+	if !*pwStdin { // --password-stdin doesn't use the config
+		// A broken config only matters without a terminal: at one,
+		// masterPassword reports it and asks for the password.
+		op, err := onePasswordConfig()
+		if err != nil && !interactive {
+			return err
+		}
+		onePassword = err == nil && op.MasterPassword != ""
+	}
 	if isTTY(os.Stdout) {
 		// Push the current title on the xterm title stack and set ours. On
 		// exit, clear it first (terminals without a title stack, like
@@ -280,7 +272,7 @@ func cmdServe(args []string) error {
 		fmt.Print("\x1b[22;0t\x1b]0;" + serveTitle + "\x07")
 		defer fmt.Print("\x1b]0;\x07\x1b[23;0t")
 	}
-	if !interactive && manualPassword {
+	if !interactive && manualPassword && !*pwStdin {
 		return fmt.Errorf("--manual needs a terminal to type the password in (or pass --password-stdin)")
 	}
 	if !interactive && !*pwStdin && !onePassword {
@@ -345,22 +337,10 @@ func cmdServe(args []string) error {
 // unlockServer unlocks the vault with the master password from 1Password or
 // typed, up to three tries.
 func unlockServer(srv *server.Server) error {
-	for tries := 0; ; tries++ {
-		pw, fromOP, err := nextMasterPassword(tries)
-		if err != nil {
-			return err
-		}
-		err = srv.Unlock(pw)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, vault.ErrWrongPassword) || tries == 2 {
-			return err
-		}
-		if err := wrongPassword(fromOP); err != nil {
-			return err
-		}
-	}
+	return withMasterPassword(func(pw string) (bool, error) {
+		err := srv.Unlock(pw)
+		return errors.Is(err, vault.ErrWrongPassword), err
+	})
 }
 
 // serveTitle is the terminal tab/window title while `agpass serve` runs.

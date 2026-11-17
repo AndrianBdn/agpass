@@ -2,14 +2,18 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"agpass/internal/api"
+	"agpass/internal/client"
 	"agpass/internal/events"
+	"agpass/internal/peer"
 	"agpass/internal/vault"
 )
 
@@ -56,5 +60,75 @@ func TestShutdownWithStalledRequest(t *testing.T) {
 		t.Logf("stopped after %s", time.Since(start).Round(time.Millisecond))
 	case <-time.After(2*shutdownGrace + 5*time.Second):
 		t.Fatal("server did not stop")
+	}
+}
+
+// A correct master password clears earlier failures, so a stale password
+// (from 1Password) followed by the typed one doesn't add up to a lockout.
+func TestMasterFailuresResetOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	const pw = "correct-horse-1"
+	if _, err := vault.Create(KeyPath(dir), pw); err != nil {
+		t.Fatal(err)
+	}
+	s := New(dir, events.New(nil, false))
+	if err := s.Unlock(pw); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < adminMaxFails+1; round++ {
+		if err := s.checkMaster("stale-password"); err == nil {
+			t.Fatal("wrong password accepted")
+		}
+		if err := s.checkMaster(pw); err != nil {
+			t.Fatalf("round %d: correct password refused: %v", round, err)
+		}
+	}
+	for i := 0; i < adminMaxFails; i++ {
+		s.checkMaster("wrong")
+	}
+	if err := s.checkMaster(pw); err == nil {
+		t.Fatal("no lockout after repeated failures")
+	}
+}
+
+// Admin codes are minted only outside agents: under one, even the master
+// password doesn't mint, or the agent could elevate itself.
+func TestMintRefusedUnderAgent(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "agp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	const pw = "correct-horse-1"
+	if _, err := vault.Create(KeyPath(dir), pw); err != nil {
+		t.Fatal(err)
+	}
+	s := New(dir, events.New(nil, false))
+	if err := s.Unlock(pw); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	c := client.New(SocketPath(dir))
+	c.Master = pw
+	mint := func() error {
+		var m api.MintResponse
+		return c.Do("POST", "/v1/mint", nil, struct{}{}, &m)
+	}
+
+	s.findAgent = func(int) (peer.Proc, peer.Agent, error) { return peer.Proc{PID: 1}, peer.Agent{Name: "claude"}, nil }
+	var ae *api.Error
+	if err := mint(); !errors.As(err, &ae) || ae.Code != api.ErrForbidden || !strings.Contains(ae.Message, "own terminal") {
+		t.Fatalf("mint under an agent: %v", err)
+	}
+	s.findAgent = func(int) (peer.Proc, peer.Agent, error) { return peer.Proc{}, peer.Agent{}, peer.ErrNoAgent }
+	if err := mint(); err != nil {
+		t.Fatalf("mint from a terminal: %v", err)
 	}
 }

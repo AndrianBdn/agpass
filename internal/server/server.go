@@ -57,17 +57,20 @@ type Server struct {
 	// masterMu admits one master-password check at a time: each Argon2
 	// verify takes 128 MiB, and failures must be counted before the next
 	// guess is evaluated.
-	masterMu sync.Mutex
-	inflight sync.WaitGroup // running handlers, drained before the store closes
-	ln       net.Listener
-	agent    agentState // SSH agent socket
-	resolver *peer.Resolver
+	masterMu  sync.Mutex
+	inflight  sync.WaitGroup // running handlers, drained before the store closes
+	ln        net.Listener
+	agent     agentState // SSH agent socket
+	resolver  *peer.Resolver
+	findAgent func(pid int) (peer.Proc, peer.Agent, error) // resolver.FindAgent; tests replace it
 }
 
 var ErrNoVault = errors.New("no vault yet: run `agpass setup` to create one")
 
 func New(dir string, log *events.Log) *Server {
-	return &Server{Dir: dir, Log: log, otps: map[string]time.Time{}, resolver: peer.NewResolver()}
+	s := &Server{Dir: dir, Log: log, otps: map[string]time.Time{}, resolver: peer.NewResolver()}
+	s.findAgent = s.resolver.FindAgent
+	return s
 }
 
 func SocketPath(dir string) string { return filepath.Join(dir, "agpass.sock") }
@@ -319,7 +322,7 @@ func (s *Server) authenticate(r *http.Request, mode authMode) (*caller, error) {
 // agentCaller finds the agent process above pid and its session, creating
 // the session on first use.
 func (s *Server) agentCaller(pid int) (*caller, error) {
-	proc, agent, err := s.resolver.FindAgent(pid)
+	proc, agent, err := s.findAgent(pid)
 	if errors.Is(err, peer.ErrNoAgent) {
 		return nil, errf(http.StatusUnauthorized, api.ErrNeedAdmin, "not running under a recognised agent; use the master password")
 	}
@@ -346,6 +349,23 @@ func (s *Server) agentCaller(pid int) (*caller, error) {
 	return c, nil
 }
 
+// agentAncestor names the agent (e.g. "claude") the requesting process runs
+// under, or "" when it runs under none.
+func (s *Server) agentAncestor(r *http.Request) (string, error) {
+	pi, _ := r.Context().Value(peerKey{}).(peerInfo)
+	if pi.err != nil || pi.pid == 0 {
+		return "", fmt.Errorf("cannot identify peer process")
+	}
+	_, agent, err := s.findAgent(pi.pid)
+	if errors.Is(err, peer.ErrNoAgent) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return agent.Name, nil
+}
+
 func (s *Server) checkMaster(pw string) error {
 	s.masterMu.Lock()
 	defer s.masterMu.Unlock()
@@ -359,6 +379,11 @@ func (s *Server) checkMaster(pw string) error {
 	s.mu.Unlock()
 
 	if kf.Verify(pw, dek) {
+		// A correct password clears earlier failures (e.g. a stale
+		// password from 1Password followed by the typed one).
+		s.mu.Lock()
+		s.adminFails = nil
+		s.mu.Unlock()
 		return nil
 	}
 	s.mu.Lock()
@@ -374,7 +399,7 @@ func (s *Server) checkMaster(pw string) error {
 	} else {
 		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "master-auth", Msg: "wrong master password"})
 	}
-	return errf(http.StatusUnauthorized, api.ErrForbidden, "wrong master password")
+	return errf(http.StatusUnauthorized, api.ErrWrongMaster, "wrong master password")
 }
 
 func recent(ts []time.Time, window time.Duration) []time.Time {

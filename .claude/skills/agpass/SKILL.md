@@ -44,7 +44,9 @@ user for the master password.
 
 When the user wants you to manage agpass itself (all folders, other projects'
 secrets, the `SYSTEM` folder with the gatekeeper's OpenAI key), they run
-`agpass mint` and give you a code:
+`agpass mint` in their own terminal and give you a code. You can't mint one
+yourself: agpass refuses `mint` and never uses 1Password for commands run
+under Claude. Ask the user instead.
 
 ```sh
 agpass elevate agp-xxxx-xxxx

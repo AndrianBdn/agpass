@@ -70,14 +70,17 @@ agpass's rules:
   vault means an offline guessing attack on the master password, so use a
   strong one (at least 10 characters is enforced).
 - **The master password isn't stored anywhere an agent can read.** You type
-  it when `serve` starts, or 1Password supplies it behind Touch ID.
+  it when `serve` starts, or 1Password supplies it behind Touch ID. agpass
+  never runs `op` from inside an agent's process tree, so an agent can't
+  start a 1Password prompt that would unlock 1Password in its own session.
 - **The server's memory can't be read.** The binary runs with the hardened
   runtime: debuggers can't attach (`lldb -p` is refused, while it attaches
   to the same binary built without it), dylibs can't be injected, and core
   dumps are off. A program the agent compiles can't get the server's task
   port at all. This assumes the agent has no root (no passwordless `sudo`).
-- **Admin access needs you.** Minting a code takes the master password or
-  your Touch ID.
+- **Admin access needs you.** Codes are minted only from your own
+  terminal: the server refuses `mint` from a process running under Claude,
+  even with the master password.
 
 What an agent *can* still do is work within agpass's rules in ways they don't
 foresee: the main one is editing `.git/config` to look like another
@@ -177,10 +180,12 @@ To let one Claude session manage everything (all folders and `SYSTEM`), mint
 a code and give it to Claude:
 
 ```sh
-agpass mint           # master password; prints agp-xxxx-xxxx (redeem within 10 minutes)
+agpass mint           # in your own terminal; prints agp-xxxx-xxxx (redeem within 10 minutes)
 ```
 
 Claude runs `agpass elevate agp-xxxx-xxxx` and has admin access for 1 hour.
+`mint` is refused when run from inside Claude (a `!` command included), so an
+agent can't mint a code for itself.
 
 ### 7. SSH for agents
 
@@ -230,10 +235,15 @@ without a terminal). `--manual` on any command skips 1Password. With
 1Password configured, `serve` also starts without a terminal (log lines
 instead of the dashboard).
 
-An agent that runs `agpass mint` also triggers the 1Password prompt: approve
-only what you started. Once approved, `op` may stay unlocked for that
-terminal session for a while (1Password's setting), so later requests from
-the same place may not prompt again; every mint shows on the dashboard.
+**agpass never runs `op` from inside an agent's process tree** (a process
+under Claude, found the same way the server identifies agents). Approving a
+1Password prompt an agent started would leave `op` unlocked in the agent's
+session for a while (1Password's setting): the agent could then run
+`op read` itself and get the master password, or anything else in your
+1Password, without another prompt. So commands an agent runs that need the
+master password fail with "run this in your own terminal", and
+the server also refuses `mint` from a process under Claude. If you see a 1Password
+prompt for `op` you didn't start, deny it.
 
 ## Instructions for agents
 
@@ -268,7 +278,8 @@ Everything runs as your user. That's deliberate for v1, and it means:
 - **Your own SSH keys stay readable to agents** (`~/.ssh`, your ssh-agent): the agpass agent keeps well-behaved agents on the agpass key, it doesn't hide yours.
 - **The repository comes from `.git/config`**, which an agent can edit: setting another project's `origin` would get that project's folders. Fine against confusion, not against a determined agent.
 - **The LLM gatekeeper guards against confusion, not malice.** The reason it judges is written by the agent.
-- **An agent can edit the agpass config file**: the worst it can do is point 1Password at the wrong item, and then you type the password.
+- **An agent can edit the agpass config file**: it can point 1Password at the wrong item or break the file; at a terminal you then type the password (and `agpass setup` replaces a broken file), but `serve` without a terminal won't start.
+- **"Under Claude" is checked by process ancestry.** A process an agent detaches (e.g. double-forked, so its parent becomes `launchd`) no longer looks like it runs under Claude: it could run `agpass mint` and trigger a 1Password prompt. Deny `op` prompts you didn't start; approving one gives that process 1Password, including the master password, while `op` stays unlocked.
 
 ## License
 

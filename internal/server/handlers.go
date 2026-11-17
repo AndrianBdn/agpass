@@ -44,6 +44,16 @@ func (s *Server) status(r *http.Request, c *caller) (any, error) {
 
 // mint creates a one-time code that gives one agent session admin access.
 func (s *Server) mint(r *http.Request, c *caller) (any, error) {
+	// Codes come from the user's own terminal. Run inside an agent, even
+	// with the master password, mint would let the agent elevate itself.
+	if name, err := s.agentAncestor(r); err != nil || name != "" {
+		msg := "admin codes can only be minted in your own terminal, not by a process running under " + name
+		if err != nil {
+			msg = "cannot check which process asked for an admin code: " + err.Error()
+		}
+		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "mint", Actor: c.String(), Msg: msg})
+		return nil, errf(http.StatusForbidden, api.ErrForbidden, "%s", msg)
+	}
 	m := s.mintCode()
 	s.Log.Emit(events.Event{Level: events.LevelWarn, Action: "mint", Actor: c.String(),
 		Msg: fmt.Sprintf("admin code valid until %s", m.ExpiresAt.Format("15:04:05"))})

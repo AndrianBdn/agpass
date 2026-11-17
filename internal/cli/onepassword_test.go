@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"agpass/internal/api"
@@ -27,19 +28,19 @@ func TestUnquote(t *testing.T) {
 			t.Errorf("unquote(%q) = %q", in, got)
 		}
 	}
-	if got := opArgs(config.OnePassword{MasterPassword: `"op://P/I/f"`}); got[2] != "op://P/I/f" {
+	if got := opArgs(config.OnePassword{MasterPassword: `"op://P/I/f"`}); got[len(got)-1] != "op://P/I/f" {
 		t.Errorf("opArgs kept quotes: %q", got)
 	}
 }
 
 func TestOpArgs(t *testing.T) {
 	got := opArgs(config.OnePassword{MasterPassword: "op://Private/AgPass/password", Account: "my.1password.com"})
-	want := []string{"read", "--no-newline", "op://Private/AgPass/password", "--account", "my.1password.com"}
+	want := []string{"read", "--no-newline", "--account", "my.1password.com", "--", "op://Private/AgPass/password"}
 	if !slices.Equal(got, want) {
 		t.Errorf("reference: %q", got)
 	}
-	got = opArgs(config.OnePassword{MasterPassword: "AgPass master"})
-	want = []string{"item", "get", "AgPass master", "--fields", "label=password", "--reveal"}
+	got = opArgs(config.OnePassword{MasterPassword: "-AgPass master"})
+	want = []string{"item", "get", "--fields", "label=password", "--reveal", "--format", "json", "--", "-AgPass master"}
 	if !slices.Equal(got, want) {
 		t.Errorf("item: %q", got)
 	}
@@ -76,6 +77,8 @@ func opVault(t *testing.T) (dir string) {
 	os.WriteFile(filepath.Join(dir, "config.toml"), []byte("[onepassword]\nmaster_password = \"op://Private/AgPass/password\"\n"), 0o600)
 	t.Setenv("AGPASS_DIR", dir)
 	manualPassword = false
+	resetOPConfig(t)
+	asAgent(t, "") // a human's terminal; the tests themselves run under Claude
 	return dir
 }
 
@@ -107,7 +110,7 @@ func TestUnlockServerOnePassword(t *testing.T) {
 	if !srv.Unlocked() {
 		t.Fatal("not unlocked")
 	}
-	if b, _ := os.ReadFile(argsFile); string(b) != "read\n--no-newline\nop://Private/AgPass/password\n" {
+	if b, _ := os.ReadFile(argsFile); string(b) != "read\n--no-newline\n--\nop://Private/AgPass/password\n" {
 		t.Errorf("op called with %q", b)
 	}
 }
@@ -127,13 +130,15 @@ func TestAdminCommandOnePassword(t *testing.T) {
 	go func() { done <- srv.Serve(ctx) }()
 	defer func() { cancel(); <-done }()
 
+	// An admin command (list --admin); mint itself is refused for this
+	// test process by the server, since it runs under Claude.
 	mint := func() error {
 		c, err := newConn(true)
 		if err != nil {
 			return err
 		}
-		var m api.MintResponse
-		return c.call("POST", "/v1/mint", nil, struct{}{}, &m)
+		var l api.ListResponse
+		return c.call("GET", "/v1/list", nil, nil, &l)
 	}
 	fakeOp(t, testPW, 0)
 	if err := mint(); err != nil {
@@ -226,5 +231,74 @@ func TestSetupOnePassword(t *testing.T) {
 	}
 	if cfg2, _ := config.Load(path); cfg2 != cfg {
 		t.Fatalf("changed to %+v", cfg2)
+	}
+}
+
+func TestDescribeOPEscapes(t *testing.T) {
+	got := describeOP(config.OnePassword{MasterPassword: "op://P/\x1b[2J/password", Account: "a\x07"})
+	if strings.ContainsAny(got, "\x1b\x07") {
+		t.Fatalf("not escaped: %q", got)
+	}
+}
+
+// resetOPConfig forgets the cached config (tests switch AGPASS_DIR).
+func resetOPConfig(t *testing.T) {
+	opConfig.once = sync.Once{}
+	t.Cleanup(func() { opConfig.once = sync.Once{} })
+}
+
+// An item name is read as JSON, so a password with quotes and commas (which
+// op would CSV-quote in plain output) comes through intact.
+func TestOpItemJSON(t *testing.T) {
+	const pw = `ab"c,d 12345`
+	dir := t.TempDir()
+	p := filepath.Join(dir, "op")
+	script := "#!/bin/sh\ncat <<'EOF'\n{\"id\":\"password\",\"type\":\"CONCEALED\",\"label\":\"password\",\"value\":\"ab\\\"c,d 12345\"}\nEOF\n"
+	os.WriteFile(p, []byte(script), 0o700)
+	old := opCommand
+	opCommand = p
+	defer func() { opCommand = old }()
+	got, err := opMasterPassword(context.Background(), config.OnePassword{MasterPassword: "AgPass master"})
+	if err != nil || got != pw {
+		t.Fatalf("got %q %v", got, err)
+	}
+}
+
+// A broken config (agents can write it) doesn't block setup: it offers to
+// replace it.
+func TestSetupOnePasswordBrokenConfig(t *testing.T) {
+	dir := opVault(t)
+	path := filepath.Join(dir, "config.toml")
+	os.WriteFile(path, []byte("[onepassword]\nfoo = 1\n"), 0o600)
+	fakeOpScript(t, testPW)
+	withStdin(t, "y\n1\nop://P/AgPass/password\n")
+	if err := setupOnePassword(dir); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil || cfg.OnePassword.MasterPassword != "op://P/AgPass/password" {
+		t.Fatalf("got %+v %v", cfg, err)
+	}
+}
+
+// asAgent makes agentAncestor report name ("" = no agent).
+func asAgent(t *testing.T, name string) {
+	old := agentAncestor
+	agentAncestor = func() (string, error) { return name, nil }
+	t.Cleanup(func() { agentAncestor = old })
+}
+
+// Under an agent, op is never run: approving its prompt would unlock
+// 1Password in the agent's session.
+func TestNoOpUnderAgent(t *testing.T) {
+	opVault(t)
+	argsFile := fakeOp(t, testPW, 0)
+	asAgent(t, "claude")
+	_, _, err := masterPassword()
+	if err == nil || !strings.Contains(err.Error(), "not used for commands run under claude") {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := os.Stat(argsFile); err == nil {
+		t.Fatal("op ran under an agent")
 	}
 }

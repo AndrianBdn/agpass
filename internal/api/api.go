@@ -41,6 +41,7 @@ const (
 	ErrBadRequest  = "bad_request"
 	ErrLocked      = "locked"
 	ErrRateLimited = "rate_limited"
+	ErrWrongMaster = "wrong_master_password"
 	ErrConflict    = "conflict"
 	ErrInternal    = "internal"
 )

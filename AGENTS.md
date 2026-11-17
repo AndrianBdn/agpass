@@ -25,7 +25,7 @@ gofmt -l .                      # must print nothing
 
 Packages under `internal/`:
 
-- **`cli`**: every command. Human commands get the master password from `masterPassword()` (1Password via `op` when `[onepassword]` is configured, else typed; `--manual` forces typing) and send it as `X-Agpass-Master`. Agent commands send nothing: the server identifies them.
+- **`cli`**: every command. Human commands get the master password from `masterPassword()` (1Password via `op` when `[onepassword]` is configured, but never from a process under an agent; else typed; `--manual` forces typing) and send it as `X-Agpass-Master`. Agent commands send nothing: the server identifies them.
 - **`server`**: HTTP handlers (`handlers.go`), auth, sessions, SSH agent (`ssh.go`).
   - Each route has an auth mode: `authNone`, `authAdmin` (master password), or `authSession` (master password or a verified agent process).
   - The resulting `caller` is `admin` (master password), `elevated` (agent session that redeemed a minted code, for 1 hour), or a plain agent session. `c.full()` is admin-or-elevated.
@@ -61,6 +61,7 @@ Access flow for `connect`:
 3. Otherwise the LLM gatekeeper decides.
 
 Invariants:
+- `mint` is refused for a requester running under an agent, even with the master password (`agentAncestor` in the server and in the CLI).
 - Agents may only link folders to their own repository.
 - `SYSTEM` (gatekeeper key in `SYSTEM/openai`, SSH key in `SYSTEM/ssh`) is never granted to a plain session.
 - `SYSTEM/ssh` can't be read or replaced even by an elevated session, only with the master password (`sshKeyGuard`).
