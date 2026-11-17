@@ -2,8 +2,8 @@
 // view of the audit log with a status header.
 //
 // It is deliberately view-only. Agents may be able to type into the
-// terminal (tmux send-keys) and read the screen, so no key here mints a
-// code, grants access or shows a secret. The worst a keypress can do is
+// terminal (tmux send-keys) and read the screen, so no key here grants
+// access or shows a secret. The worst a keypress can do is
 // stop the server, and that takes q twice.
 //
 // It drives the terminal directly (raw mode + ANSI) instead of using a TUI

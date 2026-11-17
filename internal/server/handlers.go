@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"agpass/internal/api"
 	"agpass/internal/events"
@@ -22,9 +23,9 @@ func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/status", s.handle(authNone, s.status))
 	mux.HandleFunc("POST /v1/mint", s.handle(authAdmin, s.mint))
-	mux.HandleFunc("POST /v1/connect", s.handle(authAgent, s.connect))
+	mux.HandleFunc("POST /v1/elevate", s.handle(authSession, s.elevate))
+	mux.HandleFunc("POST /v1/connect", s.handle(authSession, s.connect))
 	mux.HandleFunc("GET /v1/whoami", s.handle(authSession, s.whoami))
-	mux.HandleFunc("POST /v1/request-access", s.handle(authSession, s.requestAccess))
 	mux.HandleFunc("GET /v1/list", s.handle(authSession, s.list))
 	mux.HandleFunc("GET /v1/item", s.handle(authSession, s.getItem))
 	mux.HandleFunc("POST /v1/item", s.handle(authSession, s.setItem))
@@ -37,41 +38,38 @@ func (s *Server) status(r *http.Request, c *caller) (any, error) {
 	return api.StatusResponse{Version: api.Version, Unlocked: s.Unlocked()}, nil
 }
 
+// mint creates a one-time code that gives one agent session admin access.
 func (s *Server) mint(r *http.Request, c *caller) (any, error) {
 	m := s.mintCode()
-	s.Log.Emit(events.Event{Level: events.LevelOK, Action: "mint", Actor: c.String(), Msg: "connect code valid until " + m.ExpiresAt.Format("15:04:05")})
+	s.Log.Emit(events.Event{Level: events.LevelWarn, Action: "mint", Actor: c.String(),
+		Msg: fmt.Sprintf("admin code valid until %s", m.ExpiresAt.Format("15:04:05"))})
 	return m, nil
 }
 
-func (s *Server) connect(r *http.Request, c *caller) (any, error) {
+// elevate redeems an admin code: the calling agent session gets access to
+// every folder, SYSTEM included, for ElevateDuration.
+func (s *Server) elevate(r *http.Request, c *caller) (any, error) {
 	if c.admin {
-		return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "connect is for agent sessions")
+		return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "elevate is for agent sessions; the master password already has full access")
 	}
-	var req api.ConnectRequest
+	var req api.ElevateRequest
 	if err := decode(r, &req); err != nil {
 		return nil, err
 	}
-	if c.session != nil { // already connected: keep the code for another session
-		s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "connect", Actor: c.String(), Msg: "already connected; code not used"})
-		return s.sessionInfo(c.session)
-	}
 	restore, err := s.redeemCode(strings.TrimSpace(req.Code))
 	if err != nil {
-		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "connect", Actor: c.String(), Msg: err.Error()})
+		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "elevate", Actor: c.String(), Msg: err.Error()})
 		return nil, err
 	}
-	cwd, _ := peer.Cwd(c.agent.PID) // the agent's own cwd, not what the client claims
-	sess, err := s.st.UpsertSession(store.Session{
-		ID: randomID("s-"), PID: c.agent.PID, StartUS: c.agent.StartUS,
-		Agent: c.name, Exe: c.agent.Exe, Cwd: cwd,
-	})
-	if err != nil {
+	until := time.Now().Add(ElevateDuration)
+	if err := s.st.SetSessionAdmin(c.session.ID, until); err != nil {
 		restore()
 		return nil, err
 	}
-	c.session = &sess
-	s.Log.Emit(events.Event{Level: events.LevelOK, Action: "connect", Actor: c.String(), Target: cwd, Msg: "session bound to " + c.agent.Exe})
-	return s.sessionInfo(&sess)
+	c.session.AdminUntil, c.elevated = until, true
+	s.Log.Emit(events.Event{Level: events.LevelAlert, Action: "elevate", Actor: c.String(), Target: "all folders",
+		Msg: "admin access incl. SYSTEM until " + until.Format("15:04")})
+	return s.sessionInfo(c.session)
 }
 
 func (s *Server) whoami(r *http.Request, c *caller) (any, error) {
@@ -90,15 +88,23 @@ func (s *Server) sessionInfo(sess *store.Session) (api.SessionInfo, error) {
 	if err != nil {
 		return api.SessionInfo{}, err
 	}
-	return api.SessionInfo{
+	info := api.SessionInfo{
 		ID: sess.ID, Agent: sess.Agent, PID: sess.PID, Exe: sess.Exe, Cwd: sess.Cwd,
 		Repo: sess.Repo, Reason: sess.Reason, CreatedAt: sess.CreatedAt, Grants: grants,
-	}, nil
+	}
+	if time.Now().Before(sess.AdminUntil) {
+		until := sess.AdminUntil
+		info.AdminUntil = &until
+	}
+	return info, nil
 }
 
-func (s *Server) requestAccess(r *http.Request, c *caller) (any, error) {
+// connect records what the session works on and grants folders: those
+// listing its repository, a new folder for the repository (create), and
+// whatever the gatekeeper approves.
+func (s *Server) connect(r *http.Request, c *caller) (any, error) {
 	if c.admin {
-		return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "the master password already has access to everything")
+		return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "connect is for agent sessions; the master password already has access to everything")
 	}
 	var req api.AccessRequest
 	if err := decode(r, &req); err != nil {
@@ -108,13 +114,12 @@ func (s *Server) requestAccess(r *http.Request, c *caller) (any, error) {
 		return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "a reason is required: say what you are working on and why you need secrets")
 	}
 	// The repository is worked out from the agent process's own working
-	// directory. What the client says (--repo, its cwd) is only a claim: the
-	// LLM sees it, repository matching never uses it.
-	cwd, err := peer.Cwd(c.agent.PID)
+	// directory. What the client says (--repo) is only a claim: the LLM sees
+	// it, repository matching never uses it.
+	cwd, repo, err := s.sessionRepo(c)
 	if err != nil {
-		return nil, fmt.Errorf("read working directory of %s pid %d: %w", c.name, c.agent.PID, err)
+		return nil, err
 	}
-	repo := NormalizeRepo(GitOrigin(cwd))
 	claimed := NormalizeRepo(req.Repo)
 	if claimed == repo {
 		claimed = ""
@@ -146,11 +151,14 @@ func (s *Server) requestAccess(r *http.Request, c *caller) (any, error) {
 
 	// 1. Deterministic: folders whose repos list contains the session's repo.
 	var candidates []llm.FolderInfo
+	repoHasFolder := false
 	for _, f := range folders {
+		listsRepo := repo != "" && slices.ContainsFunc(f.Repos, func(r string) bool { return NormalizeRepo(r) == repo })
+		repoHasFolder = repoHasFolder || listsRepo
 		if f.Name == api.SystemFolder || have[f.Name] {
 			continue
 		}
-		if repo != "" && slices.ContainsFunc(f.Repos, func(r string) bool { return NormalizeRepo(r) == repo }) {
+		if listsRepo {
 			if err := grant(f.Name, "repo-match", "repository "+repo+" is listed on the folder"); err != nil {
 				return nil, err
 			}
@@ -163,19 +171,36 @@ func (s *Server) requestAccess(r *http.Request, c *caller) (any, error) {
 		candidates = append(candidates, llm.FolderInfo{Name: f.Name, Project: f.Project, Description: f.Description, Repos: f.Repos, WrittenBy: writtenBy})
 	}
 
-	// 2. LLM: when nothing matched, or the agent asked for folders it doesn't have yet.
+	// 2. A folder of its own for a repository that has none yet.
+	if req.Create && !repoHasFolder {
+		f, err := s.createOwnFolder(c, repo, req)
+		if err != nil {
+			return nil, err
+		}
+		g, err := s.st.Grant(c.session.ID, f.Name, "created", "folder created by this session for "+repo)
+		if err != nil {
+			return nil, err
+		}
+		have[f.Name] = true
+		resp.Granted = append(resp.Granted, g)
+		resp.Created = f.Name
+	} else if req.Create {
+		resp.Explanation = "this repository already has a folder; no new folder created. "
+	}
+
+	// 3. LLM: when nothing matched, or the agent asked for folders it doesn't have yet.
 	pending := slices.DeleteFunc(slices.Clone(req.Folders), func(f string) bool { return have[f] })
 	if len(candidates) > 0 && (len(resp.Granted) == 0 || len(pending) > 0) {
 		key, model := s.gatekeeper()
 		if key == "" {
-			resp.Explanation = "LLM gatekeeper not configured (the user can set it up with `agpass setup`); only repository matches are granted"
+			resp.Explanation += "LLM gatekeeper not configured (the user can set it up with `agpass setup`); only repository matches are granted"
 		} else {
 			d, err := llm.Decide(r.Context(), key, model, llm.Request{Repo: repo, ClaimedRepo: claimed, Cwd: cwd, Reason: req.Reason, Requested: req.Folders, Folders: candidates})
 			if err != nil {
 				s.Log.Emit(events.Event{Level: events.LevelWarn, Action: "llm", Actor: c.String(), Msg: err.Error()})
-				resp.Explanation = "LLM gatekeeper failed: " + err.Error()
+				resp.Explanation += "LLM gatekeeper failed: " + err.Error()
 			} else {
-				resp.Explanation = d.Explanation
+				resp.Explanation += d.Explanation
 				for _, name := range d.Grant {
 					if slices.ContainsFunc(candidates, func(f llm.FolderInfo) bool { return f.Name == name }) && !have[name] {
 						if err := grant(name, "llm", d.Explanation); err != nil {
@@ -195,7 +220,7 @@ func (s *Server) requestAccess(r *http.Request, c *caller) (any, error) {
 		}
 	}
 	if len(resp.Denied) > 0 {
-		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "request-access", Actor: c.String(), Target: strings.Join(resp.Denied, ","), Msg: truncate(req.Reason, 80)})
+		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "connect", Actor: c.String(), Target: strings.Join(resp.Denied, ","), Msg: truncate(req.Reason, 80)})
 	}
 	if resp.Session, err = s.sessionInfo(c.session); err != nil {
 		return nil, err
@@ -231,6 +256,107 @@ func (s *Server) gatekeeper() (key, model string) {
 	return key, model
 }
 
+// sessionRepo reads the agent process's working directory from the kernel
+// and the git origin of the repository there.
+func (s *Server) sessionRepo(c *caller) (cwd, repo string, err error) {
+	cwd, err = peer.Cwd(c.agent.PID)
+	if err != nil {
+		return "", "", fmt.Errorf("read working directory of %s pid %d: %w", c.name, c.agent.PID, err)
+	}
+	return cwd, NormalizeRepo(GitOrigin(cwd)), nil
+}
+
+// agentRepos checks the repositories an agent wants on a folder: only its own
+// session's repository is allowed, so a folder can't be pushed onto another
+// project's sessions. nil means "this session's repository".
+func (s *Server) agentRepos(c *caller, want *[]string) ([]string, error) {
+	_, repo, err := s.sessionRepo(c)
+	if err != nil {
+		return nil, err
+	}
+	if want == nil {
+		if repo == "" {
+			return []string{}, nil
+		}
+		return []string{repo}, nil
+	}
+	out := []string{}
+	for _, r := range *want {
+		n := NormalizeRepo(r)
+		if n == "" {
+			continue
+		}
+		if n != repo {
+			return nil, errf(http.StatusForbidden, api.ErrForbidden,
+				"agents can only link a folder to their own repository (%s); ask the user to add %s", orNone(repo), n)
+		}
+		if !slices.Contains(out, n) {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+func orNone(repo string) string {
+	if repo == "" {
+		return "none: not in a git repository with an origin remote"
+	}
+	return repo
+}
+
+// createOwnFolder creates the folder for the session's repository during
+// connect --create, named after the repository unless req.Name is given.
+func (s *Server) createOwnFolder(c *caller, repo string, req api.AccessRequest) (api.Folder, error) {
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		if repo == "" {
+			return api.Folder{}, errf(http.StatusBadRequest, api.ErrBadRequest,
+				"not in a git repository with an origin remote: pass --name for the new folder")
+		}
+		name = folderNameFor(repo)
+	}
+	if !nameRe.MatchString(name) || strings.EqualFold(name, api.SystemFolder) {
+		return api.Folder{}, errf(http.StatusBadRequest, api.ErrBadRequest, "invalid folder name %q", name)
+	}
+	desc := strings.TrimSpace(req.Description)
+	if desc == "" {
+		desc = "Secrets for " + orNone(repo) + " (folder created by an agent)"
+	}
+	repos := []string{}
+	if repo != "" {
+		repos = []string{repo}
+	}
+	project := name
+	err := s.st.CreateFolder(api.FolderRequest{Name: name, Project: &project, Description: &desc, Repos: &repos}, c.String())
+	if errors.Is(err, store.ErrExists) {
+		return api.Folder{}, errf(http.StatusConflict, api.ErrConflict,
+			"a folder named %q already exists for another project: pass --name to choose another name", name)
+	}
+	if err != nil {
+		return api.Folder{}, err
+	}
+	s.Log.Emit(events.Event{Level: events.LevelOK, Action: "folder-create", Actor: c.String(), Target: name, Msg: "for " + orNone(repo)})
+	return s.st.GetFolder(name)
+}
+
+// folderNameFor turns github.com/acme/My.App into "my.app".
+func folderNameFor(repo string) string {
+	base := repo[strings.LastIndexByte(repo, '/')+1:]
+	var b strings.Builder
+	for _, r := range strings.ToLower(base) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	name := strings.TrimLeft(b.String(), "._-")
+	if len(name) > 64 {
+		name = name[:64]
+	}
+	return name
+}
+
 func (s *Server) grantSet(c *caller) (map[string]bool, error) {
 	out := map[string]bool{}
 	if c.session == nil {
@@ -244,7 +370,7 @@ func (s *Server) grantSet(c *caller) (map[string]bool, error) {
 }
 
 func (s *Server) checkAccess(c *caller, folder string) error {
-	if c.admin {
+	if c.full() {
 		return nil
 	}
 	if folder == api.SystemFolder {
@@ -255,7 +381,7 @@ func (s *Server) checkAccess(c *caller, folder string) error {
 		return err
 	}
 	if !have[folder] {
-		return errf(http.StatusForbidden, api.ErrForbidden, "this session has no access to folder %q; run `agpass request-access --reason ...`", folder)
+		return errf(http.StatusForbidden, api.ErrForbidden, "this session has no access to folder %q; run `agpass connect --reason ...`", folder)
 	}
 	return nil
 }
@@ -275,7 +401,7 @@ func (s *Server) list(r *http.Request, c *caller) (any, error) {
 		if only != "" && f.Name != only {
 			continue
 		}
-		if c.admin || have[f.Name] {
+		if c.full() || have[f.Name] {
 			if f.Items, err = s.st.ListItems(f.Name); err != nil {
 				return nil, err
 			}
@@ -404,6 +530,14 @@ func (s *Server) createFolder(r *http.Request, c *caller) (any, error) {
 	if req.Project == nil || strings.TrimSpace(*req.Project) == "" {
 		return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "--project is required: say which project this folder is for")
 	}
+	if !c.full() {
+		repos, err := s.agentRepos(c, req.Repos)
+		if err != nil {
+			s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "folder-create", Actor: c.String(), Target: req.Name, Msg: err.Error()})
+			return nil, err
+		}
+		req.Repos = &repos
+	}
 	err := s.st.CreateFolder(req, c.String())
 	if errors.Is(err, store.ErrExists) {
 		return nil, errf(http.StatusConflict, api.ErrConflict, "folder %q already exists", req.Name)
@@ -428,6 +562,14 @@ func (s *Server) editFolder(r *http.Request, c *caller) (any, error) {
 	if err := s.checkAccess(c, req.Name); err != nil {
 		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "folder-edit", Actor: c.String(), Target: req.Name})
 		return nil, err
+	}
+	if !c.full() && req.Repos != nil {
+		repos, err := s.agentRepos(c, req.Repos)
+		if err != nil {
+			s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "folder-edit", Actor: c.String(), Target: req.Name, Msg: err.Error()})
+			return nil, err
+		}
+		req.Repos = &repos
 	}
 	f, err := s.st.UpdateFolder(req, c.String())
 	if errors.Is(err, store.ErrNotFound) {

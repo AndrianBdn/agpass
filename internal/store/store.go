@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 	repo       TEXT NOT NULL DEFAULT '',
 	reason     TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL,
+	admin_until TEXT NOT NULL DEFAULT '',
 	UNIQUE (pid, start_us)
 );
 
@@ -133,6 +134,9 @@ type Session struct {
 	Repo      string
 	Reason    string
 	CreatedAt time.Time
+	// AdminUntil is when admin access from `agpass elevate` ends (zero:
+	// never elevated).
+	AdminUntil time.Time
 }
 
 // Open opens (or creates) the database at dir/agpass.db with dek.
@@ -155,6 +159,10 @@ func Open(dir string, dek []byte, allowRollback bool) (*Store, error) {
 			return nil, fmt.Errorf("cannot decrypt %s (wrong key or corrupted file)", path)
 		}
 		return nil, fmt.Errorf("init schema: %w", err)
+	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		db.Close()
@@ -189,6 +197,37 @@ func Open(dir string, dek []byte, allowRollback bool) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// migrate adds columns introduced after a vault was created.
+func migrate(db *sql.DB) error {
+	cols := map[string]map[string]string{
+		"sessions": {"admin_until": `TEXT NOT NULL DEFAULT ''`},
+	}
+	for table, add := range cols {
+		have := map[string]bool{}
+		rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var n string
+			if err := rows.Scan(&n); err != nil {
+				rows.Close()
+				return err
+			}
+			have[n] = true
+		}
+		rows.Close()
+		for col, def := range add {
+			if !have[col] {
+				if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + col + ` ` + def); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
 
 func (s *Store) generation() (int64, error) {
 	var v string
@@ -453,12 +492,14 @@ func (s *Store) SetItem(folder, name string, fields []api.Field, remove []string
 
 // ---- sessions ----
 
-func (s *Store) UpsertSession(sess Session) (Session, error) {
+// UpsertSession returns the session of the process (pid, start), creating it
+// from sess if there is none; created reports which.
+func (s *Store) UpsertSession(sess Session) (out Session, created bool, err error) {
 	if existing, err := s.SessionByProc(sess.PID, sess.StartUS); err == nil {
-		return existing, nil // fast path, no write
+		return existing, false, nil // fast path, no write
 	}
-	out := sess
-	err := s.write(func(tx *sql.Tx) error {
+	out = sess
+	err = s.write(func(tx *sql.Tx) error {
 		// Re-check inside the transaction: a concurrent connect for the same
 		// process may have inserted it since.
 		existing, err := sessionByProc(tx, sess.PID, sess.StartUS)
@@ -470,27 +511,38 @@ func (s *Store) UpsertSession(sess Session) (Session, error) {
 			return err
 		}
 		out.CreatedAt = time.Now()
+		created = true
 		_, err = tx.Exec(`INSERT INTO sessions (id, pid, start_us, agent, exe, cwd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			out.ID, out.PID, out.StartUS, out.Agent, out.Exe, out.Cwd, ts(out.CreatedAt))
 		return err
 	})
-	return out, err
+	return out, created, err
 }
 
 func (s *Store) SessionByProc(pid int, startUS int64) (Session, error) {
 	return sessionByProc(s.db, pid, startUS)
 }
 
+const sessionCols = `id, pid, start_us, agent, exe, cwd, repo, reason, created_at, admin_until`
+
 func sessionByProc(q queryer, pid int, startUS int64) (Session, error) {
 	var sess Session
-	var ca string
-	err := q.QueryRow(`SELECT id, pid, start_us, agent, exe, cwd, repo, reason, created_at FROM sessions WHERE pid=? AND start_us=?`, pid, startUS).
-		Scan(&sess.ID, &sess.PID, &sess.StartUS, &sess.Agent, &sess.Exe, &sess.Cwd, &sess.Repo, &sess.Reason, &ca)
+	var ca, au string
+	err := q.QueryRow(`SELECT `+sessionCols+` FROM sessions WHERE pid=? AND start_us=?`, pid, startUS).
+		Scan(&sess.ID, &sess.PID, &sess.StartUS, &sess.Agent, &sess.Exe, &sess.Cwd, &sess.Repo, &sess.Reason, &ca, &au)
 	if errors.Is(err, sql.ErrNoRows) {
 		return sess, ErrNotFound
 	}
-	sess.CreatedAt = parseTS(ca)
+	sess.CreatedAt, sess.AdminUntil = parseTS(ca), parseTS(au)
 	return sess, err
+}
+
+// SetSessionAdmin gives the session admin access until the given time.
+func (s *Store) SetSessionAdmin(id string, until time.Time) error {
+	return s.write(func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE sessions SET admin_until=? WHERE id=?`, ts(until), id)
+		return err
+	})
 }
 
 func (s *Store) UpdateSessionClaims(id, cwd, repo, reason string) error {
@@ -573,7 +625,7 @@ func (s *Store) Counts() (Counts, error) {
 
 // Sessions returns all sessions (live or not).
 func (s *Store) Sessions() ([]Session, error) {
-	rows, err := s.db.Query(`SELECT id, pid, start_us, agent, exe, cwd, repo, reason, created_at FROM sessions`)
+	rows, err := s.db.Query(`SELECT ` + sessionCols + ` FROM sessions`)
 	if err != nil {
 		return nil, err
 	}
@@ -581,11 +633,11 @@ func (s *Store) Sessions() ([]Session, error) {
 	var out []Session
 	for rows.Next() {
 		var sess Session
-		var ca string
-		if err := rows.Scan(&sess.ID, &sess.PID, &sess.StartUS, &sess.Agent, &sess.Exe, &sess.Cwd, &sess.Repo, &sess.Reason, &ca); err != nil {
+		var ca, au string
+		if err := rows.Scan(&sess.ID, &sess.PID, &sess.StartUS, &sess.Agent, &sess.Exe, &sess.Cwd, &sess.Repo, &sess.Reason, &ca, &au); err != nil {
 			return nil, err
 		}
-		sess.CreatedAt = parseTS(ca)
+		sess.CreatedAt, sess.AdminUntil = parseTS(ca), parseTS(au)
 		out = append(out, sess)
 	}
 	return out, rows.Err()

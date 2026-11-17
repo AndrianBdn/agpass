@@ -83,7 +83,7 @@ func TestConcurrentUpsertSession(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sess, err := s.UpsertSession(Session{ID: fmt.Sprintf("s%d", i), PID: 42, StartUS: 7, Agent: "claude", Exe: "/x"})
+			sess, _, err := s.UpsertSession(Session{ID: fmt.Sprintf("s%d", i), PID: 42, StartUS: 7, Agent: "claude", Exe: "/x"})
 			if err != nil {
 				t.Error(err)
 				return
@@ -145,5 +145,36 @@ func TestEvents(t *testing.T) {
 	}
 	if len(got) != 3 || got[0].Action != "a2" || got[2].Action != "a4" {
 		t.Fatalf("want a2..a4 oldest first, got %+v", got)
+	}
+}
+
+// A vault created before admin_until existed gets the column on open.
+func TestMigrateAddsAdminUntil(t *testing.T) {
+	dir := t.TempDir()
+	dek := make([]byte, 32)
+	rand.Read(dek)
+	s, err := Open(dir, dek, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.UpsertSession(Session{ID: "s1", PID: 1, StartUS: 2, Agent: "claude", Exe: "/x"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE sessions DROP COLUMN admin_until`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open(dir, dek, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	until := time.Now().Add(time.Hour).Truncate(time.Microsecond)
+	if err := s.SetSessionAdmin("s1", until); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.SessionByProc(1, 2)
+	if err != nil || !got.AdminUntil.Equal(until) {
+		t.Fatalf("got %v %v, want %v", got.AdminUntil, err, until)
 	}
 }

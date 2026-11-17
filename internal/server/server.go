@@ -1,10 +1,10 @@
 // Package server is the agpass daemon: HTTP over a Unix socket.
 //
 // Callers are identified by the socket peer pid: the server walks up its
-// ancestry to the nearest signed agent process (e.g. Claude Code). A session
-// is bound to that process's (pid, start time) after it redeems a one-time
-// code minted by the human. Humans authenticate per request with the master
-// password (X-Agpass-Master).
+// ancestry to the nearest process running signed agent code (e.g. Claude
+// Code). Each such process gets a session, bound to its (pid, start time),
+// on its first request; grants decide what it can read. Humans authenticate
+// per request with the master password (X-Agpass-Master).
 package server
 
 import (
@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,11 +31,12 @@ import (
 )
 
 const (
-	otpTTL          = 10 * time.Minute
 	adminMaxFails   = 5
 	adminLockout    = 5 * time.Minute
-	connectMaxFails = 10
 	failWindow      = 10 * time.Minute
+	otpTTL          = 10 * time.Minute // time to redeem a minted admin code
+	codeMaxFails    = 10
+	ElevateDuration = time.Hour // admin access from one code
 )
 
 type Server struct {
@@ -46,9 +48,9 @@ type Server struct {
 	kf         *vault.KeyFile
 	dek        []byte
 	st         *store.Store
-	otps       map[string]time.Time // sha256(code) -> expiry
 	adminFails []time.Time
 	adminLock  time.Time
+	otps       map[string]time.Time // sha256(admin code) -> expiry
 	codeFails  []time.Time
 
 	// masterMu admits one master-password check at a time: each Argon2
@@ -198,11 +200,15 @@ type peerInfo struct {
 }
 
 type caller struct {
-	admin   bool
-	agent   peer.Proc
-	name    string // agent name, e.g. claude
-	session *store.Session
+	admin    bool // the human, with the master password
+	elevated bool // an agent session with unexpired admin access (agpass elevate)
+	agent    peer.Proc
+	name     string // agent name, e.g. claude
+	session  *store.Session
 }
+
+// full reports whether the caller may access every folder, SYSTEM included.
+func (c *caller) full() bool { return c.admin || c.elevated }
 
 func (c *caller) String() string {
 	if c.admin {
@@ -212,6 +218,9 @@ func (c *caller) String() string {
 	if c.session != nil {
 		s += " " + c.session.ID
 	}
+	if c.elevated {
+		s += " [admin]"
+	}
 	return s
 }
 
@@ -220,8 +229,7 @@ type authMode int
 const (
 	authNone    authMode = iota // no identity needed
 	authAdmin                   // master password required
-	authAgent                   // agent process required, session optional
-	authSession                 // admin or connected agent session
+	authSession                 // admin, or an agent process (its session is created on first use)
 )
 
 type apiErr struct {
@@ -289,15 +297,21 @@ func (s *Server) authenticate(r *http.Request, mode authMode) (*caller, error) {
 		return nil, err
 	}
 	c := &caller{agent: proc, name: agent.Name}
-	sess, err := s.st.SessionByProc(proc.PID, proc.StartUS)
-	if err == nil {
-		c.session = &sess
-	} else if !errors.Is(err, store.ErrNotFound) {
+	// Any verified agent process gets a session on its first request; what
+	// it may read is decided by grants (repository match, gatekeeper, or
+	// folders it created).
+	cwd, _ := peer.Cwd(proc.PID)
+	sess, created, err := s.st.UpsertSession(store.Session{
+		ID: randomID("s-"), PID: proc.PID, StartUS: proc.StartUS,
+		Agent: agent.Name, Exe: proc.Exe, Cwd: cwd,
+	})
+	if err != nil {
 		return nil, err
 	}
-	if mode == authSession && c.session == nil {
-		return nil, errf(http.StatusUnauthorized, api.ErrNotConnected,
-			"this %s session (pid %d) is not connected to agpass. Ask the user to run `agpass mint` and give you the code, then run `agpass connect <code>`.", agent.Name, proc.PID)
+	c.session = &sess
+	c.elevated = time.Now().Before(sess.AdminUntil)
+	if created {
+		s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "session", Actor: c.String(), Target: tilde(cwd), Msg: "new " + agent.Name + " session"})
 	}
 	return c, nil
 }
@@ -382,7 +396,7 @@ func (s *Server) mintCode() api.MintResponse {
 }
 
 // redeemCode consumes code and returns a func that puts it back, for when
-// the session can't be created after all. Repeated failures invalidate all
+// elevation fails after all. Repeated failures invalidate all
 // outstanding codes.
 func (s *Server) redeemCode(code string) (restore func(), err error) {
 	s.mu.Lock()
@@ -400,10 +414,10 @@ func (s *Server) redeemCode(code string) (restore func(), err error) {
 		}
 	}
 	s.codeFails = recent(append(s.codeFails, time.Now()), failWindow)
-	if len(s.codeFails) >= connectMaxFails {
+	if len(s.codeFails) >= codeMaxFails {
 		s.otps = map[string]time.Time{}
 		s.codeFails = nil
-		go s.Log.Emit(events.Event{Level: events.LevelAlert, Action: "code-lockout", Msg: "too many invalid connect codes; all outstanding codes revoked"})
+		go s.Log.Emit(events.Event{Level: events.LevelAlert, Action: "code-lockout", Msg: "too many invalid admin codes; all outstanding codes revoked"})
 	}
 	return nil, errf(http.StatusUnauthorized, api.ErrForbidden, "invalid, expired or already used code")
 }
@@ -450,21 +464,15 @@ func (s *Server) History(n int) ([]events.Event, error) {
 type Status struct {
 	Folders, Items     int
 	Sessions, LiveSess int
-	Codes              int
+	AdminSess          int    // live sessions with unexpired admin access
 	Gatekeeper         string // model, or "" when not configured
 }
 
 func (s *Server) Status() (Status, error) {
 	s.mu.Lock()
 	st := s.st
-	codes := 0
-	for _, exp := range s.otps {
-		if time.Now().Before(exp) {
-			codes++
-		}
-	}
 	s.mu.Unlock()
-	out := Status{Codes: codes}
+	out := Status{}
 	if st == nil {
 		return out, nil
 	}
@@ -484,7 +492,18 @@ func (s *Server) Status() (Status, error) {
 	for _, sess := range sessions {
 		if p, err := peer.Info(sess.PID); err == nil && p.StartUS == sess.StartUS {
 			out.LiveSess++
+			if time.Now().Before(sess.AdminUntil) {
+				out.AdminSess++
+			}
 		}
 	}
 	return out, nil
+}
+
+// tilde shortens a path under the home directory for display.
+func tilde(p string) string {
+	if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(p, home+"/") {
+		return "~" + p[len(home):]
+	}
+	return p
 }

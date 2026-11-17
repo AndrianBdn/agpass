@@ -64,3 +64,16 @@ func must(t *testing.T, err error) {
 		t.Fatal(err)
 	}
 }
+
+func TestFolderNameFor(t *testing.T) {
+	for in, want := range map[string]string{
+		"github.com/acme/crm":       "crm",
+		"github.com/acme/My App":    "my-app",
+		"gitlab.com/x/.dotfiles":    "dotfiles",
+		"github.com/acme/api.v2_go": "api.v2_go",
+	} {
+		if got := folderNameFor(in); got != want {
+			t.Errorf("folderNameFor(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

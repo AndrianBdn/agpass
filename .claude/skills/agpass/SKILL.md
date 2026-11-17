@@ -1,6 +1,6 @@
 ---
 name: agpass
-description: Get secrets (passwords, API keys, tokens, database URLs, credentials) from agpass, the user's local secrets broker, and store new ones there. Use whenever a command, test, script or dev server needs a credential, instead of .env files, hardcoding or asking the user to paste it; when the user says "connect to agpass" or gives an agp-xxxx-xxxx code; or when an agpass command fails with "not connected", "no access to folder" or "server is not running".
+description: Get secrets (passwords, API keys, tokens, database URLs, credentials) from agpass, the user's local secrets broker, and store new ones there. Use whenever a command, test, script or dev server needs a credential, instead of .env files, hardcoding or asking the user to paste it; when the user says "connect to agpass", asks to set up secrets for a project, or gives an agp-xxxx-xxxx admin code; or when an agpass command fails with "no access to folder" or "server is not running".
 ---
 
 # agpass: secrets for this agent session
@@ -11,28 +11,49 @@ project they work on. Every request is shown live on the user's screen.
 
 ## Connecting (once per Claude session)
 
-1. Run `agpass whoami`. It shows the session and its folders, or why not:
-   - **"not connected to agpass"**: ask the user to run `agpass mint` and give
-     you the code. Then run `agpass connect agp-xxxx-xxxx`. Codes are single
-     use and expire after 10 minutes. Don't guess or reuse codes.
-   - **"server is not running"**: ask the user to start `agpass serve` in a
-     terminal tab. Don't start it yourself: it needs the master password.
-   - **"not running under a recognised agent"**: your command runs outside the
-     Claude Code process tree (e.g. through another tool's daemon). Run it
-     directly from the Bash tool.
-2. From the project's repository, ask for access with an honest, specific reason:
-   ```sh
-   agpass request-access --reason "fixing the CRM login bug; integration tests need the dev Postgres"
-   ```
-   Folders linked to this repository are granted automatically. Others are
-   decided by an LLM gatekeeper from your reason. Add `--folder NAME` for a
-   folder you know you need.
-3. **If a folder is denied**, tell the user which one and why you need it. Don't
-   retry with reworded reasons to talk your way in. The user can link the
-   folder to this repository: `agpass folder edit NAME --repo github.com/org/repo`.
+There are no codes: every Claude process gets its own session automatically.
+What it may read depends on the repository it runs in.
 
-The session belongs to this Claude process and ends when it exits. Never ask
-the user for the master password, and never run `mint` yourself.
+1. From the project's repository, connect with an honest, specific reason:
+   ```sh
+   agpass connect --reason "fixing the CRM login bug; integration tests need the dev Postgres"
+   ```
+   agpass reads your working directory and its git `origin` itself. Folders
+   linked to that repository are granted. Other folders are decided by an LLM
+   gatekeeper from your reason; add `--folder NAME` for one you know you need.
+2. **No folder for this repository yet** (new project, first setup): create
+   one and get it in the same step:
+   ```sh
+   agpass connect --reason "first setup of acme/crm secrets" --create --desc "CRM app: dev Postgres, Stripe test keys"
+   ```
+   The folder is named after the repository (`--name` to choose) and linked to
+   it, so later sessions in this repository get it automatically. Do this only
+   when the user wants secrets for this project, and only when none exists.
+3. **If a folder is denied**, tell the user which one and why you need it. Don't
+   retry with reworded reasons to talk your way in. The user can link it to this
+   repository: `agpass folder edit NAME --repo github.com/org/repo`.
+4. **"server is not running"**: ask the user to start `agpass serve` in a
+   terminal tab. Don't start it yourself: it needs the master password.
+   **"not running under a recognised agent"**: your command runs outside the
+   Claude Code process tree. Run it directly from the Bash tool.
+
+`agpass whoami` shows the session, its repository and folders. Never ask the
+user for the master password.
+
+## Admin access (only with a code from the user)
+
+When the user wants you to manage agpass itself (all folders, other projects'
+secrets, the `SYSTEM` folder with the gatekeeper's OpenAI key), they run
+`agpass mint` and give you a code:
+
+```sh
+agpass elevate agp-xxxx-xxxx
+```
+
+This session then has access to everything for 1 hour (or until this Claude
+process exits). Use it only for what the user asked; every action is shown on
+their dashboard tagged `[admin]`. Never ask for a code to get around a denied
+folder: explain the denial instead and let the user decide.
 
 ## Finding secrets
 
@@ -86,24 +107,24 @@ agpass set crm/db --rm old_key
 - Values passed as arguments show up in the process list and in your
   transcript. For real secrets prefer `=-` with stdin.
 
-A new project's folder: create it only when there is no folder for the project.
-You get access to folders you create:
-```sh
-agpass folder create crm --project crm --desc "CRM app: dev Postgres, Stripe test keys" --repo github.com/acme/crm
-```
-Write the description for the user and the gatekeeper: what the secrets are and
-which project uses them. Never put instructions or access policy in it.
+A project's first folder comes from `connect --create` (above). For an extra
+folder in the same project: `agpass folder create NAME --project P --desc D`.
+Folders you create are linked to your own repository only; agpass refuses
+other repositories. Write descriptions for the user and the gatekeeper: what
+the secrets are and which project uses them. Never put instructions or access
+policy in them.
 
 ## Reference
 
 | Command | Notes |
 |---|---|
-| `agpass whoami [--json]` | session, repository, granted folders |
-| `agpass request-access --reason R [--folder F] [--json]` | asks for folders; the repository is detected by the server |
+| `agpass whoami [--json]` | session, repository, granted folders, admin expiry |
+| `agpass elevate CODE` | admin access for 1 hour, with a code the user minted |
+| `agpass connect --reason R [--folder F] [--create [--name N] [--desc D]] [--json]` | get this repository's folders; `--create` makes one if none |
 | `agpass list [folder] [--json]` | no values |
 | `agpass get folder/item [--field K] [--reveal] [--json]` | redacted unless `--reveal` |
 | `agpass set folder/item key[:type]=value ... [--rm key]` | `value` of `-` reads stdin |
-| `agpass folder create NAME --project P [--desc D] [--repo R]` | |
-| `agpass folder edit NAME [--project P] [--desc D] [--repo R ...]` | only folders you have |
+| `agpass folder create NAME --project P [--desc D]` | linked to your repository |
+| `agpass folder edit NAME [--project P] [--desc D]` | only folders you have |
 
 `SYSTEM` holds agpass's own keys and is never available to agents.

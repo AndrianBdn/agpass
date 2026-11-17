@@ -79,7 +79,7 @@ func cmdSetup(args []string) error {
 		fmt.Println(msg)
 	} else {
 		fmt.Println(ui.ok("Done.") + " Next: start the server in a terminal tab with " + ui.bold("agpass serve") +
-			", then connect an agent with " + ui.bold("agpass mint") + ".")
+			". Agents then connect on their own.")
 	}
 	return nil
 }

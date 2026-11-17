@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -34,13 +33,17 @@ Human:
   agpass setup                     create the vault and configure the LLM gatekeeper (interactive)
   agpass serve                     run the server in a terminal tab: asks for the master
                                    password, then shows the live event log
-  agpass mint                      create a one-time code that connects one agent session
+  agpass mint                      one-time code that gives one Claude session admin access
+                                   (all folders incl. SYSTEM) for 1 hour
   Any command below also works for the human: it asks for the master password
   (or pass --admin).
 
-Agent (run inside Claude Code):
-  agpass connect <code>            bind this agent session using the code the user gave you
-  agpass request-access --reason "what you work on and why you need secrets" [--repo R] [--folder F]
+Agent (run inside Claude Code; each Claude process gets its own session automatically):
+  agpass connect --reason "what you work on and why you need secrets"
+                                   get the folders of this repository (and others the gatekeeper allows)
+      --create [--name N] [--desc D]   no folder for this repository yet? create one and get it
+      --folder F                   a folder you think you need (repeatable)
+  agpass elevate <code>            admin access for this session, with a code the user minted
   agpass whoami                    show this session and its folders
   agpass list [folder]             list folders and items (no values)
   agpass get folder/item           show an item, secrets redacted as [REDACTED_AGPASS]
@@ -50,7 +53,7 @@ Agent (run inside Claude Code):
   agpass set folder/item key[:type]=value ... [--rm key]
                                    types: text (default), sensitive, password, url
                                    value "-" reads the value from the terminal/stdin
-  agpass folder create NAME --project P [--desc D] [--repo github.com/org/repo]
+  agpass folder create NAME --project P [--desc D]   (agents: linked to their own repository)
   agpass folder edit NAME [--project P] [--desc D] [--repo R ...]
 
 Data: $AGPASS_DIR, else $XDG_DATA_HOME/agpass, else ~/.local/share/agpass
@@ -88,19 +91,19 @@ var commands map[string]func([]string) error
 
 func init() {
 	commands = map[string]func([]string) error{
-		"serve":          cmdServe,
-		"setup":          cmdSetup,
-		"mint":           cmdMint,
-		"connect":        cmdConnect,
-		"whoami":         cmdWhoami,
-		"request-access": cmdRequestAccess,
-		"list":           cmdList,
-		"ls":             cmdList,
-		"get":            cmdGet,
-		"set":            cmdSet,
-		"folder create":  cmdFolderCreate,
-		"folder edit":    cmdFolderEdit,
-		"version":        func([]string) error { fmt.Println("agpass", api.Version); return nil },
+		"serve":         cmdServe,
+		"setup":         cmdSetup,
+		"mint":          cmdMint,
+		"elevate":       cmdElevate,
+		"connect":       cmdConnect,
+		"whoami":        cmdWhoami,
+		"list":          cmdList,
+		"ls":            cmdList,
+		"get":           cmdGet,
+		"set":           cmdSet,
+		"folder create": cmdFolderCreate,
+		"folder edit":   cmdFolderEdit,
+		"version":       func([]string) error { fmt.Println("agpass", api.Version); return nil },
 	}
 }
 
@@ -191,7 +194,7 @@ func color() bool { return isTTY(os.Stdout) && os.Getenv("NO_COLOR") == "" }
 
 func cwd() string { d, _ := os.Getwd(); return d }
 
-// ---- serve / unlock / mint / log ----
+// ---- serve ----
 
 func cmdServe(args []string) error {
 	fs := pflag.NewFlagSet("serve", pflag.ContinueOnError)
@@ -208,9 +211,12 @@ func cmdServe(args []string) error {
 	}
 	interactive := !*pwStdin && isTTY(os.Stdin) && isTTY(os.Stdout)
 	if isTTY(os.Stdout) {
-		// Save the current title (xterm title stack), set ours, restore on exit.
+		// Push the current title on the xterm title stack and set ours. On
+		// exit, clear it first (terminals without a title stack, like
+		// Ghostty, then fall back to their default title), then pop (where
+		// supported, this restores the exact previous title).
 		fmt.Print("\x1b[22;0t\x1b]0;" + serveTitle + "\x07")
-		defer fmt.Print("\x1b[23;0t")
+		defer fmt.Print("\x1b]0;\x07\x1b[23;0t")
 	}
 	if !interactive && !*pwStdin {
 		return fmt.Errorf("run `agpass serve` in a terminal, or pass --password-stdin")
@@ -291,8 +297,8 @@ func statusLine(srv *server.Server) string {
 		return "status unavailable: " + err.Error()
 	}
 	s := fmt.Sprintf("● serving · %d live sessions (%d total) · %d folders · %d items", st.LiveSess, st.Sessions, st.Folders, st.Items)
-	if st.Codes > 0 {
-		s += fmt.Sprintf(" · %d unused codes", st.Codes)
+	if st.AdminSess > 0 {
+		s += fmt.Sprintf(" · ‼ %d admin", st.AdminSess)
 	}
 	if st.Gatekeeper != "" {
 		s += " · gatekeeper " + st.Gatekeeper
@@ -309,6 +315,54 @@ func tildePath(p string) string {
 	return p
 }
 
+// ---- agent session ----
+
+func cmdConnect(args []string) error {
+	fs := pflag.NewFlagSet("connect", pflag.ContinueOnError)
+	reason := fs.String("reason", "", "what you are working on and why you need secrets (required)")
+	folders := fs.StringArray("folder", nil, "folder you think you need (repeatable)")
+	create := fs.Bool("create", false, "create a folder for this repository if it has none")
+	name := fs.String("name", "", "name of the folder --create makes (default: repository name)")
+	desc := fs.String("desc", "", "description of the folder --create makes: what secrets it holds")
+	repo := fs.String("repo", "", "repository you work on, if not the one in the current directory (informational)")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("connect takes no arguments (codes are no longer needed); use --reason")
+	}
+	c := client.New(server.SocketPath(dataDir()))
+	var resp api.AccessResponse
+	req := api.AccessRequest{Repo: *repo, Reason: *reason, Folders: *folders, Create: *create, Name: *name, Description: *desc}
+	if err := c.Do("POST", "/v1/connect", nil, req, &resp); err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(resp)
+	}
+	s := resp.Session
+	fmt.Printf("Connected: session %s (%s pid %d) · repo %s\n", s.ID, s.Agent, s.PID, orDash(clean(s.Repo)))
+	if resp.Created != "" {
+		fmt.Printf("created  %s for this repository\n", clean(resp.Created))
+	}
+	for _, g := range resp.Granted {
+		fmt.Printf("granted  %-20s (%s)\n", clean(g.Folder), clean(g.By))
+	}
+	for _, d := range resp.Denied {
+		fmt.Printf("denied   %s\n", clean(d))
+	}
+	if resp.Explanation != "" {
+		fmt.Println("\n" + clean(strings.TrimSpace(resp.Explanation)))
+	}
+	fmt.Println()
+	printGrants(s.Grants)
+	if len(s.Grants) == 0 && !*create {
+		fmt.Println(`No folder for this repository yet? Run again with --create --desc "<what secrets it will hold>".`)
+	}
+	return nil
+}
+
 func cmdMint(args []string) error {
 	fs := pflag.NewFlagSet("mint", pflag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
@@ -322,33 +376,39 @@ func cmdMint(args []string) error {
 	if err := c.call("POST", "/v1/mint", nil, struct{}{}, &m); err != nil {
 		return err
 	}
-	fmt.Printf("Connect code: %s  (single use, valid until %s)\n\n", m.Code, m.ExpiresAt.Local().Format("15:04"))
-	fmt.Printf("Tell your agent:\n  connect to agpass with `agpass connect %s`\n", m.Code)
+	fmt.Printf("Admin code: %s  (single use, redeem by %s)\n\n", m.Code, m.ExpiresAt.Local().Format("15:04"))
+	fmt.Printf("It gives one Claude session access to every folder, SYSTEM included, for %s.\n", server.ElevateDuration)
+	fmt.Printf("Tell Claude:\n  run `agpass elevate %s`\n", m.Code)
 	return nil
 }
 
-// ---- agent session ----
-
-func cmdConnect(args []string) error {
-	fs := pflag.NewFlagSet("connect", pflag.ContinueOnError)
+func cmdElevate(args []string) error {
+	fs := pflag.NewFlagSet("elevate", pflag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: agpass connect <code>")
+		return fmt.Errorf("usage: agpass elevate <code>   (the user creates the code with `agpass mint`)")
 	}
 	c := client.New(server.SocketPath(dataDir()))
 	var info api.SessionInfo
-	if err := c.Do("POST", "/v1/connect", nil, api.ConnectRequest{Code: fs.Arg(0), Cwd: cwd()}, &info); err != nil {
+	if err := c.Do("POST", "/v1/elevate", nil, api.ElevateRequest{Code: fs.Arg(0)}, &info); err != nil {
 		return err
 	}
-	fmt.Printf("Connected: session %s (%s pid %d)\n", info.ID, info.Agent, info.PID)
-	if len(info.Grants) == 0 {
-		fmt.Println(`Next: agpass request-access --reason "<what you are working on and why you need secrets>"`)
-	} else {
-		printGrants(info.Grants)
+	until := "?"
+	if info.AdminUntil != nil {
+		until = info.AdminUntil.Local().Format("15:04")
 	}
+	fmt.Printf("Admin access for session %s (%s pid %d) until %s: every folder, SYSTEM included.\n", info.ID, info.Agent, info.PID, until)
+	fmt.Println("Every action is logged on the user's dashboard. Use it only for what the user asked.")
 	return nil
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func cmdWhoami(args []string) error {
@@ -374,8 +434,11 @@ func cmdWhoami(args []string) error {
 	}
 	s := w.Session
 	fmt.Printf("session %s · %s pid %d · since %s\n", s.ID, s.Agent, s.PID, s.CreatedAt.Local().Format("2006-01-02 15:04"))
+	if s.AdminUntil != nil {
+		fmt.Printf("ADMIN until %s: every folder, SYSTEM included\n", s.AdminUntil.Local().Format("15:04"))
+	}
 	if s.Repo != "" || s.Cwd != "" {
-		fmt.Printf("repo %s · cwd %s\n", clean(s.Repo), clean(s.Cwd))
+		fmt.Printf("repo %s · cwd %s\n", orDash(clean(s.Repo)), clean(s.Cwd))
 	}
 	printGrants(s.Grants)
 	return nil
@@ -390,45 +453,6 @@ func printGrants(gs []api.Grant) {
 	for _, g := range gs {
 		fmt.Printf("  %-20s %s\n", clean(g.Folder), clean(g.By))
 	}
-}
-
-func cmdRequestAccess(args []string) error {
-	fs := pflag.NewFlagSet("request-access", pflag.ContinueOnError)
-	reason := fs.String("reason", "", "what you are working on and why you need secrets (required)")
-	repo := fs.String("repo", "", "repository (default: git remote origin of the current directory)")
-	folders := fs.StringArray("folder", nil, "folder you think you need (repeatable)")
-	asJSON := fs.Bool("json", false, "JSON output")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *repo == "" {
-		out, _ := exec.Command("git", "remote", "get-url", "origin").Output()
-		*repo = strings.TrimSpace(string(out))
-	}
-	c := client.New(server.SocketPath(dataDir()))
-	var resp api.AccessResponse
-	err := c.Do("POST", "/v1/request-access", nil, api.AccessRequest{Repo: *repo, Reason: *reason, Folders: *folders, Cwd: cwd()}, &resp)
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		return printJSON(resp)
-	}
-	for _, g := range resp.Granted {
-		fmt.Printf("granted  %-20s (%s)\n", clean(g.Folder), clean(g.By))
-	}
-	for _, d := range resp.Denied {
-		fmt.Printf("denied   %s\n", clean(d))
-	}
-	if len(resp.Granted) == 0 && len(resp.Denied) == 0 {
-		fmt.Println("No new folders granted.")
-	}
-	if resp.Explanation != "" {
-		fmt.Println("\n" + clean(resp.Explanation))
-	}
-	fmt.Println()
-	printGrants(resp.Session.Grants)
-	return nil
 }
 
 // ---- data commands ----
@@ -486,7 +510,7 @@ func cmdList(args []string) error {
 		for _, o := range resp.Others {
 			names = append(names, fmt.Sprintf("%s (%s)", clean(o.Name), clean(o.Project)))
 		}
-		fmt.Printf("\nOther folders (use request-access): %s\n", strings.Join(names, ", "))
+		fmt.Printf("\nOther folders (agpass connect --folder NAME): %s\n", strings.Join(names, ", "))
 	}
 	return nil
 }

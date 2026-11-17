@@ -35,15 +35,14 @@ func ValidType(t string) bool {
 
 // Error codes.
 const (
-	ErrNeedAdmin    = "need_admin"
-	ErrNotConnected = "not_connected"
-	ErrForbidden    = "forbidden"
-	ErrNotFound     = "not_found"
-	ErrBadRequest   = "bad_request"
-	ErrLocked       = "locked"
-	ErrRateLimited  = "rate_limited"
-	ErrConflict     = "conflict"
-	ErrInternal     = "internal"
+	ErrNeedAdmin   = "need_admin"
+	ErrForbidden   = "forbidden"
+	ErrNotFound    = "not_found"
+	ErrBadRequest  = "bad_request"
+	ErrLocked      = "locked"
+	ErrRateLimited = "rate_limited"
+	ErrConflict    = "conflict"
+	ErrInternal    = "internal"
 )
 
 type Error struct {
@@ -111,15 +110,16 @@ type Grant struct {
 }
 
 type SessionInfo struct {
-	ID        string    `json:"id"`
-	Agent     string    `json:"agent"`
-	PID       int       `json:"pid"`
-	Exe       string    `json:"exe"`
-	Cwd       string    `json:"cwd"`
-	Repo      string    `json:"repo"`
-	Reason    string    `json:"reason"`
-	CreatedAt time.Time `json:"created_at"`
-	Grants    []Grant   `json:"grants"`
+	ID         string     `json:"id"`
+	Agent      string     `json:"agent"`
+	PID        int        `json:"pid"`
+	Exe        string     `json:"exe"`
+	Cwd        string     `json:"cwd"`
+	Repo       string     `json:"repo"`
+	Reason     string     `json:"reason"`
+	CreatedAt  time.Time  `json:"created_at"`
+	Grants     []Grant    `json:"grants"`
+	AdminUntil *time.Time `json:"admin_until,omitempty"` // set while elevated
 }
 
 type WhoamiResponse struct {
@@ -132,25 +132,32 @@ type StatusResponse struct {
 	Unlocked bool   `json:"unlocked"`
 }
 
+// MintResponse is a one-time admin code (POST /v1/mint).
 type MintResponse struct {
 	Code      string    `json:"code"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-type ConnectRequest struct {
+// ElevateRequest redeems an admin code for the calling agent session.
+type ElevateRequest struct {
 	Code string `json:"code"`
-	Cwd  string `json:"cwd"`
 }
 
+// AccessRequest is the body of POST /v1/connect.
 type AccessRequest struct {
-	Repo    string   `json:"repo"`
+	Repo    string   `json:"repo,omitempty"` // claimed repository (informational)
 	Reason  string   `json:"reason"`
 	Folders []string `json:"folders,omitempty"`
-	Cwd     string   `json:"cwd"`
+	// Create makes a folder for the session's repository if none lists it,
+	// named Name (default: the repository name).
+	Create      bool   `json:"create,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 type AccessResponse struct {
 	Granted     []Grant     `json:"granted"`
+	Created     string      `json:"created,omitempty"` // folder created by --create
 	Denied      []string    `json:"denied,omitempty"`
 	Explanation string      `json:"explanation,omitempty"`
 	Session     SessionInfo `json:"session"`

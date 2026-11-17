@@ -29,7 +29,7 @@ func New(sock string) *Client {
 	return &Client{
 		sock: sock,
 		http: &http.Client{
-			Timeout: 3 * time.Minute, // request-access may wait on the LLM
+			Timeout: 3 * time.Minute, // connect may wait on the LLM
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 					var d net.Dialer
