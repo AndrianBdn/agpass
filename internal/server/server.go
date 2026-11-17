@@ -37,6 +37,7 @@ const (
 	otpTTL          = 10 * time.Minute // time to redeem a minted admin code
 	codeMaxFails    = 10
 	ElevateDuration = time.Hour // admin access from one code
+	shutdownGrace   = 5 * time.Second
 )
 
 type Server struct {
@@ -147,6 +148,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	srv := &http.Server{
 		Handler:           s.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second, // a request body that never arrives can't hold a handler
+		IdleTimeout:       2 * time.Minute,
 		BaseContext:       func(net.Listener) context.Context { return reqCtx },
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			pid, err := peer.PeerPID(c)
@@ -162,10 +165,14 @@ func (s *Server) Serve(ctx context.Context) error {
 			return
 		}
 		s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "shutdown", Msg: "waiting for running requests"})
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
 		if srv.Shutdown(sctx) != nil {
-			cancelReqs() // grace period over: abort what is still running
+			// Grace period over: abort what is still running. Cancelling
+			// stops LLM calls; closing the connections unblocks handlers
+			// still reading a request body.
+			cancelReqs()
+			srv.Close()
 		}
 	}()
 	s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "listen", Target: sock, Msg: "agpass " + api.Version})
@@ -174,7 +181,15 @@ func (s *Server) Serve(ctx context.Context) error {
 		cancelReqs()
 	}
 	<-shutdownDone
-	s.inflight.Wait() // handlers may still be running after Shutdown returns
+	// Handlers may still be running after Shutdown returns; give them a
+	// bounded time to notice the cancellation before the store closes.
+	drained := make(chan struct{})
+	go func() { s.inflight.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(shutdownGrace):
+		s.Log.Emit(events.Event{Level: events.LevelWarn, Action: "shutdown", Msg: "requests still running; closing anyway"})
+	}
 	os.Remove(sock)
 	s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "stopped", Msg: "agpass server stopped"})
 	s.Log.Detach()
