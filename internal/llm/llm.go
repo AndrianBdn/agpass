@@ -2,20 +2,31 @@
 // described and an agent's (untrusted) justification, it picks which folders
 // to grant. It is a guardrail against confused agents, not a security
 // boundary — the justification is written by the agent.
+//
+// It calls the OpenAI Responses API over plain HTTP with a strict JSON
+// schema. Requests are sent with store=false.
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
-
-	"github.com/anthropics/anthropic-sdk-go/v2"
-	"github.com/anthropics/anthropic-sdk-go/v2/option"
 )
 
-const Model = "claude-opus-5-5"
+// DefaultModel is used unless SYSTEM/openai has a "model" field.
+const DefaultModel = "gpt-6-luna"
+
+// BaseURL is the OpenAI API root (a variable for tests).
+var BaseURL = "https://api.openai.com/v1"
+
+var httpClient = &http.Client{Timeout: 90 * time.Second}
 
 type FolderInfo struct {
 	Name        string   `json:"name"`
@@ -70,53 +81,171 @@ Return JSON: {"grant": [folder names], "explanation": one or two sentences}.`
 // Prompt returns the user message sent to the model (exported for tests).
 func Prompt(req Request) string { return buildPrompt(req) }
 
-// Decide asks Claude which folders to grant.
-func Decide(ctx context.Context, apiKey string, req Request) (Decision, error) {
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
+var decisionSchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"grant":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		"explanation": map[string]any{"type": "string"},
+	},
+	"required":             []string{"grant", "explanation"},
+	"additionalProperties": false,
+}
 
-	prompt := buildPrompt(req)
-	schema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"grant":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-			"explanation": map[string]any{"type": "string"},
-		},
-		"required":             []string{"grant", "explanation"},
-		"additionalProperties": false,
+// Decide asks the model which folders to grant.
+func Decide(ctx context.Context, apiKey, model string, req Request) (Decision, error) {
+	if model == "" {
+		model = DefaultModel
 	}
-
-	client := anthropic.NewClient(option.WithAPIKey(apiKey))
-	resp, err := client.Beta.Messages.New(ctx, anthropic.BetaMessageNewParams{
-		Model:     Model,
-		MaxTokens: 16000,
-		Betas:     []anthropic.AnthropicBeta{anthropic.AnthropicBetaServerSideFallback2026_07_01},
-		Fallbacks: anthropic.BetaFallbacksParamOfDefault(),
-		System:    []anthropic.BetaTextBlockParam{{Text: systemPrompt}},
-		OutputConfig: anthropic.BetaOutputConfigParam{
-			Effort: anthropic.BetaOutputConfigEffortLow,
-			Format: anthropic.BetaJSONOutputFormatParam{Schema: schema},
-		},
-		Messages: []anthropic.BetaMessageParam{
-			anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(prompt)),
-		},
-	})
+	body := map[string]any{
+		"model":             model,
+		"instructions":      systemPrompt,
+		"input":             buildPrompt(req),
+		"reasoning":         map[string]any{"effort": "low"},
+		"max_output_tokens": 8000,
+		"store":             false,
+		"text": map[string]any{"format": map[string]any{
+			"type": "json_schema", "name": "access_decision", "schema": decisionSchema, "strict": true,
+		}},
+	}
+	var resp response
+	if err := call(ctx, apiKey, "POST", "/responses", body, &resp); err != nil {
+		return Decision{}, err
+	}
+	text, err := resp.text()
 	if err != nil {
 		return Decision{}, err
 	}
-	if resp.StopReason == anthropic.BetaStopReasonRefusal {
-		return Decision{}, fmt.Errorf("gatekeeper model refused the request")
+	var d Decision
+	if err := json.Unmarshal([]byte(text), &d); err != nil {
+		return Decision{}, fmt.Errorf("parse gatekeeper response: %w", err)
 	}
-	for _, block := range resp.Content {
-		if t, ok := block.AsAny().(anthropic.BetaTextBlock); ok {
-			var d Decision
-			if err := json.Unmarshal([]byte(t.Text), &d); err != nil {
-				return Decision{}, fmt.Errorf("parse gatekeeper response: %w", err)
-			}
-			return d, nil
+	return d, nil
+}
+
+// Check verifies that apiKey works and can use model, without paying for a
+// request when possible: it looks the model up. Keys restricted from listing
+// models fall back to a minimal request.
+func Check(ctx context.Context, apiKey, model string) error {
+	if model == "" {
+		model = DefaultModel
+	}
+	err := call(ctx, apiKey, "GET", "/models/"+url.PathEscape(model), nil, nil)
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Status == http.StatusForbidden {
+		body := map[string]any{
+			"model": model, "input": "Reply with OK.", "max_output_tokens": 16,
+			"reasoning": map[string]any{"effort": "none"}, "store": false,
+		}
+		err = call(ctx, apiKey, "POST", "/responses", body, nil)
+	}
+	if errors.As(err, &ae) {
+		switch ae.Status {
+		case http.StatusUnauthorized:
+			return fmt.Errorf("OpenAI rejected the key (401): %s", ae.Message)
+		case http.StatusNotFound:
+			return fmt.Errorf("the key works, but model %s is not available to it (404): %s", model, ae.Message)
 		}
 	}
-	return Decision{}, fmt.Errorf("gatekeeper returned no text (stop reason %s)", resp.StopReason)
+	return err
+}
+
+// APIError is an error response from the OpenAI API.
+type APIError struct {
+	Status  int
+	Message string
+}
+
+func (e *APIError) Error() string { return fmt.Sprintf("OpenAI API %d: %s", e.Status, e.Message) }
+
+func call(ctx context.Context, apiKey, method, path string, body, out any) error {
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, BaseURL+path, rd)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	if err != nil {
+		return err
+	}
+	if res.StatusCode/100 != 2 {
+		var e struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		msg := strings.TrimSpace(string(data))
+		if json.Unmarshal(data, &e) == nil && e.Error.Message != "" {
+			msg = e.Error.Message
+		}
+		return &APIError{Status: res.StatusCode, Message: truncate(msg, 300)}
+	}
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal(data, out)
+}
+
+// response is the part of a Responses API result we read.
+type response struct {
+	Status            string `json:"status"`
+	IncompleteDetails *struct {
+		Reason string `json:"reason"`
+	} `json:"incomplete_details"`
+	Output []struct {
+		Type    string `json:"type"`
+		Content []struct {
+			Type    string `json:"type"`
+			Text    string `json:"text"`
+			Refusal string `json:"refusal"`
+		} `json:"content"`
+	} `json:"output"`
+}
+
+func (r *response) text() (string, error) {
+	if r.Status == "incomplete" {
+		reason := "unknown"
+		if r.IncompleteDetails != nil {
+			reason = r.IncompleteDetails.Reason
+		}
+		return "", fmt.Errorf("gatekeeper response incomplete (%s)", reason)
+	}
+	for _, item := range r.Output {
+		if item.Type != "message" {
+			continue
+		}
+		for _, c := range item.Content {
+			switch c.Type {
+			case "output_text":
+				return c.Text, nil
+			case "refusal":
+				return "", fmt.Errorf("gatekeeper model refused: %s", truncate(c.Refusal, 200))
+			}
+		}
+	}
+	return "", fmt.Errorf("gatekeeper returned no text (status %q)", r.Status)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func buildPrompt(req Request) string {

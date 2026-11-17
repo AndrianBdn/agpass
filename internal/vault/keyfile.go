@@ -31,6 +31,9 @@ type KeyFile struct {
 	Wrapped   []byte `json:"wrapped"`
 }
 
+// MinPasswordLen is the minimum length of a new master password.
+const MinPasswordLen = 10
+
 func Exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil

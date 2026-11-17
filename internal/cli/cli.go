@@ -31,6 +31,7 @@ import (
 const usage = `agpass — local secrets broker for AI agents
 
 Human:
+  agpass setup                     create the vault and configure the LLM gatekeeper (interactive)
   agpass serve                     run the server in a terminal tab: asks for the master
                                    password, then shows the live event log
   agpass mint                      create a one-time code that connects one agent session
@@ -88,6 +89,7 @@ var commands map[string]func([]string) error
 func init() {
 	commands = map[string]func([]string) error{
 		"serve":          cmdServe,
+		"setup":          cmdSetup,
 		"mint":           cmdMint,
 		"connect":        cmdConnect,
 		"whoami":         cmdWhoami,
@@ -205,6 +207,11 @@ func cmdServe(args []string) error {
 		return err
 	}
 	interactive := !*pwStdin && isTTY(os.Stdin) && isTTY(os.Stdout)
+	if isTTY(os.Stdout) {
+		// Save the current title (xterm title stack), set ours, restore on exit.
+		fmt.Print("\x1b[22;0t\x1b]0;" + serveTitle + "\x07")
+		defer fmt.Print("\x1b[23;0t")
+	}
 	if !interactive && !*pwStdin {
 		return fmt.Errorf("run `agpass serve` in a terminal, or pass --password-stdin")
 	}
@@ -219,28 +226,8 @@ func cmdServe(args []string) error {
 	fmt.Printf("agpass %s · %s\n", api.Version, tildePath(dir))
 	newVault := !vault.Exists(server.KeyPath(dir))
 	switch {
-	case newVault && interactive:
-		fmt.Println("No vault yet — choose a master password (it cannot be recovered).")
-		pw, err := readPassword("New master password: ")
-		if err != nil {
-			return err
-		}
-		if len(pw) < server.MinPasswordLen {
-			return fmt.Errorf("use at least %d characters", server.MinPasswordLen)
-		}
-		again, err := readPassword("Repeat: ")
-		if err != nil {
-			return err
-		}
-		if pw != again {
-			return fmt.Errorf("passwords do not match")
-		}
-		if err := srv.Create(pw); err != nil {
-			return err
-		}
 	case newVault:
-		// Creating a vault needs the password typed twice at a terminal.
-		return fmt.Errorf("no vault in %s yet: run `agpass serve` in a terminal to create one", dir)
+		return fmt.Errorf("no vault in %s yet: run `agpass setup` first", tildePath(dir))
 	case interactive:
 		for tries := 0; ; tries++ {
 			pw, err := readPassword("Master password: ")
@@ -295,6 +282,9 @@ func cmdServe(args []string) error {
 	return serr
 }
 
+// serveTitle is the terminal tab/window title while `agpass serve` runs.
+const serveTitle = "🔐 AgPass Serve"
+
 func statusLine(srv *server.Server) string {
 	st, err := srv.Status()
 	if err != nil {
@@ -303,6 +293,11 @@ func statusLine(srv *server.Server) string {
 	s := fmt.Sprintf("● serving · %d live sessions (%d total) · %d folders · %d items", st.LiveSess, st.Sessions, st.Folders, st.Items)
 	if st.Codes > 0 {
 		s += fmt.Sprintf(" · %d unused codes", st.Codes)
+	}
+	if st.Gatekeeper != "" {
+		s += " · gatekeeper " + st.Gatekeeper
+	} else {
+		s += " · gatekeeper off (agpass setup)"
 	}
 	return s
 }

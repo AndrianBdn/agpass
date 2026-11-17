@@ -166,11 +166,11 @@ func (s *Server) requestAccess(r *http.Request, c *caller) (any, error) {
 	// 2. LLM: when nothing matched, or the agent asked for folders it doesn't have yet.
 	pending := slices.DeleteFunc(slices.Clone(req.Folders), func(f string) bool { return have[f] })
 	if len(candidates) > 0 && (len(resp.Granted) == 0 || len(pending) > 0) {
-		key := s.llmKey()
+		key, model := s.gatekeeper()
 		if key == "" {
-			resp.Explanation = "LLM gatekeeper not configured (store the API key as SYSTEM/anthropic field api_key); only repository matches are granted"
+			resp.Explanation = "LLM gatekeeper not configured (the user can set it up with `agpass setup`); only repository matches are granted"
 		} else {
-			d, err := llm.Decide(r.Context(), key, llm.Request{Repo: repo, ClaimedRepo: claimed, Cwd: cwd, Reason: req.Reason, Requested: req.Folders, Folders: candidates})
+			d, err := llm.Decide(r.Context(), key, model, llm.Request{Repo: repo, ClaimedRepo: claimed, Cwd: cwd, Reason: req.Reason, Requested: req.Folders, Folders: candidates})
 			if err != nil {
 				s.Log.Emit(events.Event{Level: events.LevelWarn, Action: "llm", Actor: c.String(), Msg: err.Error()})
 				resp.Explanation = "LLM gatekeeper failed: " + err.Error()
@@ -206,17 +206,29 @@ func (s *Server) requestAccess(r *http.Request, c *caller) (any, error) {
 	return resp, nil
 }
 
-func (s *Server) llmKey() string {
-	it, err := s.st.GetItem(api.SystemFolder, "anthropic")
+// GatekeeperItem holds the gatekeeper's OpenAI settings: field api_key,
+// optional field model.
+const GatekeeperItem = "openai"
+
+// gatekeeper returns the OpenAI key and model from SYSTEM/openai; key is ""
+// when not configured.
+func (s *Server) gatekeeper() (key, model string) {
+	it, err := s.st.GetItem(api.SystemFolder, GatekeeperItem)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	for _, f := range it.Fields {
-		if f.Key == "api_key" {
-			return f.Value
+		switch f.Key {
+		case "api_key":
+			key = strings.TrimSpace(f.Value)
+		case "model":
+			model = strings.TrimSpace(f.Value)
 		}
 	}
-	return ""
+	if model == "" {
+		model = llm.DefaultModel
+	}
+	return key, model
 }
 
 func (s *Server) grantSet(c *caller) (map[string]bool, error) {

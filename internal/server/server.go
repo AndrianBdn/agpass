@@ -60,10 +60,7 @@ type Server struct {
 	resolver *peer.Resolver
 }
 
-// MinPasswordLen is the minimum length of a new master password.
-const MinPasswordLen = 10
-
-var ErrNoVault = errors.New("no vault yet: run `agpass serve` in a terminal to create one")
+var ErrNoVault = errors.New("no vault yet: run `agpass setup` to create one")
 
 func New(dir string, log *events.Log) *Server {
 	return &Server{Dir: dir, Log: log, otps: map[string]time.Time{}, resolver: peer.NewResolver()}
@@ -71,25 +68,6 @@ func New(dir string, log *events.Log) *Server {
 
 func SocketPath(dir string) string { return filepath.Join(dir, "agpass.sock") }
 func KeyPath(dir string) string    { return filepath.Join(dir, "agpass.key") }
-
-// Create makes a new vault protected by password. It is only called by
-// `agpass serve` at a terminal, after the password was typed twice; the
-// socket API can never create a vault.
-func (s *Server) Create(password string) error {
-	if len(password) < MinPasswordLen {
-		return fmt.Errorf("use at least %d characters", MinPasswordLen)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if vault.Exists(KeyPath(s.Dir)) {
-		return fmt.Errorf("a vault already exists in %s", s.Dir)
-	}
-	dek, err := vault.Create(KeyPath(s.Dir), password)
-	if err != nil {
-		return err
-	}
-	return s.open(dek, "new vault created")
-}
 
 // Unlock opens the existing vault. It never creates one.
 func (s *Server) Unlock(password string) error {
@@ -473,6 +451,7 @@ type Status struct {
 	Folders, Items     int
 	Sessions, LiveSess int
 	Codes              int
+	Gatekeeper         string // model, or "" when not configured
 }
 
 func (s *Server) Status() (Status, error) {
@@ -499,6 +478,9 @@ func (s *Server) Status() (Status, error) {
 		return out, err
 	}
 	out.Sessions = len(sessions)
+	if key, model := s.gatekeeper(); key != "" {
+		out.Gatekeeper = model
+	}
 	for _, sess := range sessions {
 		if p, err := peer.Info(sess.PID); err == nil && p.StartUS == sess.StartUS {
 			out.LiveSess++
