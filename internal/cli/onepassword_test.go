@@ -16,6 +16,22 @@ import (
 	"agpass/internal/vault"
 )
 
+func TestUnquote(t *testing.T) {
+	for in, want := range map[string]string{
+		`"op://Private/Agpass Master/password"`: "op://Private/Agpass Master/password",
+		` 'op://P/I/f' `:                        "op://P/I/f",
+		"“AgPass master”":                       "AgPass master",
+		"op://P/I/f":                            "op://P/I/f",
+	} {
+		if got := unquote(in); got != want {
+			t.Errorf("unquote(%q) = %q", in, got)
+		}
+	}
+	if got := opArgs(config.OnePassword{MasterPassword: `"op://P/I/f"`}); got[2] != "op://P/I/f" {
+		t.Errorf("opArgs kept quotes: %q", got)
+	}
+}
+
 func TestOpArgs(t *testing.T) {
 	got := opArgs(config.OnePassword{MasterPassword: "op://Private/AgPass/password", Account: "my.1password.com"})
 	want := []string{"read", "--no-newline", "op://Private/AgPass/password", "--account", "my.1password.com"}
@@ -188,9 +204,10 @@ func TestSetupOnePassword(t *testing.T) {
 		t.Fatal("config saved for a wrong item")
 	}
 
-	// Right item in the second account: saved with that account.
+	// Right item in the second account, pasted the way 1Password copies it
+	// (quoted): saved unquoted, with that account.
 	fakeOpScript(t, testPW)
-	withStdin(t, "y\n2\nop://P/AgPass/password\n")
+	withStdin(t, "y\n2\n\"op://P/AgPass/password\"\n")
 	if err := setupOnePassword(dir); err != nil {
 		t.Fatal(err)
 	}

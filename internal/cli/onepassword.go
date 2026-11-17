@@ -95,6 +95,7 @@ var opCommand = "op"
 // opArgs builds the op command line: `op read` for a secret reference,
 // `op item get` (password field) for an item name or ID.
 func opArgs(c config.OnePassword) []string {
+	c.MasterPassword = unquote(c.MasterPassword) // also when pasted quoted into the config
 	var args []string
 	if strings.HasPrefix(c.MasterPassword, "op://") {
 		args = []string{"read", "--no-newline", c.MasterPassword}
@@ -247,6 +248,7 @@ func setupOnePassword(dir string) error {
 		if err != nil {
 			return err
 		}
+		ref = unquote(ref)
 		if ref == "" {
 			fmt.Println(ui.dim("Nothing entered; the config is unchanged."))
 			return nil
@@ -269,6 +271,17 @@ func setupOnePassword(dir string) error {
 		fmt.Println(ui.ok("Saved") + " to " + tildePath(path) + ". agpass now reads the master password from 1Password (--manual types it).")
 		return nil
 	}
+}
+
+// unquote strips the quotes 1Password puts around a copied secret reference
+// ("op://Private/AgPass Master/password"), and surrounding spaces.
+func unquote(s string) string {
+	s = strings.TrimSpace(s)
+	for _, q := range []string{`"`, `'`, "“", "”", "‘", "’"} {
+		s = strings.TrimPrefix(s, q)
+		s = strings.TrimSuffix(s, q)
+	}
+	return strings.TrimSpace(s)
 }
 
 func describeOP(c config.OnePassword) string {
