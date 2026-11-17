@@ -47,6 +47,7 @@ What it protects against:
 | An agent gives itself more access | Admin access needs a one-time code that you mint with the master password (or Touch ID through 1Password). |
 | Nobody notices what happened | Every request, grant and denial goes to an encrypted audit log, live on the `serve` dashboard. |
 | Secrets at rest | The database is encrypted with a key wrapped by your master password (Argon2id). |
+| Malware that copies your files | Nothing agpass holds is in plaintext on disk, and the socket answers only Claude's process tree. See [File-stealing malware](#file-stealing-malware). |
 
 What it trusts: you, the agpass binary, the macOS kernel's process and code
 signing information, and Claude Code's Anthropic signature. The gatekeeper
@@ -87,6 +88,27 @@ foresee: the main one is editing `.git/config` to look like another
 repository and get its folders. Those are listed under
 [Known limits](#known-limits-v1), along with what takes effect only after
 you come back (a replaced binary capturing the password at the next `serve`).
+
+### File-stealing malware
+
+Common infostealers are passive: they copy well-known files (`.env`,
+`~/.aws/credentials`, `~/.ssh/id_*`, shell history, Claude Code transcripts)
+and upload them. A secret kept in agpass instead isn't in any of them:
+
+- the vault is encrypted, and copying it out leaves only an offline guessing
+  attack on the master password;
+- the agents' SSH key lives in the vault, not in `~/.ssh`;
+- transcripts and logs hold `[REDACTED_AGPASS]`, not the value, unless an
+  agent used `--reveal` and printed it;
+- the socket gives no secrets to a process that isn't running under a
+  signed Claude Code process and has no master password, so malware that
+  asks agpass directly is refused.
+
+This covers only secrets that live in agpass. Keys still in `~/.ssh`,
+`.env` files you keep, and anything an agent revealed and wrote to a file are
+as exposed as before. Malware that actively targets agpass (running itself
+under Claude, or replacing the binary to catch the master password) is the
+same out-of-scope case as a malicious agent.
 
 ## Compared to 1Password service accounts
 
