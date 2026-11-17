@@ -131,10 +131,27 @@ func ParseSessionBind(contents []byte) (Bind, error) {
 	return Bind{HostKey: hk, SessionID: m.SessionID, Forwarding: m.Forwarding}, nil
 }
 
-// UserAuthSessionID returns the session ID inside data, which must be an SSH
-// "publickey" user authentication request (RFC 4252 section 7) — the only
-// thing agpass signs.
-func UserAuthSessionID(data []byte) ([]byte, error) {
+// UserAuth is a parsed SSH publickey user authentication request: the data
+// a client asks an agent to sign.
+type UserAuth struct {
+	SessionID []byte
+	User      string
+	PublicKey ssh.PublicKey
+	// HostKey is the server's host key, included by the
+	// "publickey-hostbound-v00@openssh.com" method (OpenSSH 8.9+, when the
+	// server supports it, as GitHub does); nil for plain "publickey".
+	HostKey ssh.PublicKey
+}
+
+const (
+	methodPublicKey = "publickey"
+	methodHostBound = "publickey-hostbound-v00@openssh.com"
+)
+
+// ParseUserAuth parses data, which must be an SSH "publickey" or
+// "publickey-hostbound-v00@openssh.com" user authentication request
+// (RFC 4252 section 7; OpenSSH PROTOCOL) — the only thing agpass signs.
+func ParseUserAuth(data []byte) (UserAuth, error) {
 	var m struct {
 		SessionID []byte
 		Type      byte
@@ -144,13 +161,39 @@ func UserAuthSessionID(data []byte) ([]byte, error) {
 		Rest      []byte `ssh:"rest"`
 	}
 	if err := ssh.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("not an SSH user authentication request: %w", err)
+		return UserAuth{}, fmt.Errorf("not an SSH user authentication request: %w", err)
 	}
 	const msgUserAuthRequest = 50
-	if m.Type != msgUserAuthRequest || m.Method != "publickey" {
-		return nil, fmt.Errorf("not an SSH publickey authentication request")
+	if m.Type != msgUserAuthRequest || (m.Method != methodPublicKey && m.Method != methodHostBound) {
+		return UserAuth{}, fmt.Errorf("not an SSH publickey authentication request (method %q)", m.Method)
 	}
-	return m.SessionID, nil
+	var pk struct {
+		HasSig  bool
+		Algo    string
+		PubKey  []byte
+		HostKey []byte `ssh:"rest"`
+	}
+	if err := ssh.Unmarshal(m.Rest, &pk); err != nil {
+		return UserAuth{}, fmt.Errorf("parse publickey request: %w", err)
+	}
+	ua := UserAuth{SessionID: m.SessionID, User: m.User}
+	var err error
+	if ua.PublicKey, err = ssh.ParsePublicKey(pk.PubKey); err != nil {
+		return UserAuth{}, fmt.Errorf("parse publickey request key: %w", err)
+	}
+	switch {
+	case m.Method == methodHostBound:
+		var hk struct{ Blob []byte }
+		if err := ssh.Unmarshal(pk.HostKey, &hk); err != nil {
+			return UserAuth{}, fmt.Errorf("parse host-bound request host key: %w", err)
+		}
+		if ua.HostKey, err = ssh.ParsePublicKey(hk.Blob); err != nil {
+			return UserAuth{}, fmt.Errorf("parse host-bound request host key: %w", err)
+		}
+	case len(pk.HostKey) > 0:
+		return UserAuth{}, fmt.Errorf("unexpected data after the publickey request")
+	}
+	return ua, nil
 }
 
 // SameKey reports whether a and b are the same public key.

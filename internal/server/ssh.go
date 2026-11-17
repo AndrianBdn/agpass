@@ -235,12 +235,18 @@ func (a *connAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Si
 		}
 	}
 	bind := binds[len(binds)-1]
-	sid, err := sshagent.UserAuthSessionID(data)
+	ua, err := sshagent.ParseUserAuth(data)
 	if err != nil {
 		return deny(err.Error())
 	}
-	if !bytes.Equal(sid, bind.SessionID) {
+	if !bytes.Equal(ua.SessionID, bind.SessionID) {
 		return deny("the data to sign is not for the server the client connected to")
+	}
+	if ua.HostKey != nil && !sshagent.SameKey(ua.HostKey, bind.HostKey) {
+		return deny("the host key in the data to sign is not the server the client connected to")
+	}
+	if !sshagent.SameKey(ua.PublicKey, key) {
+		return deny("the data to sign is for a different key")
 	}
 
 	hosts, err := a.s.st.HostsForKey(authorizedKey(bind.HostKey))

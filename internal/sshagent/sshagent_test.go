@@ -93,22 +93,59 @@ func TestSessionBind(t *testing.T) {
 	}
 }
 
-func TestUserAuthSessionID(t *testing.T) {
-	data := ssh.Marshal(struct {
-		SessionID []byte
-		Type      byte
-		User      string
-		Service   string
-		Method    string
-		HasSig    bool
-		Algo      string
-		Key       []byte
-	}{[]byte("sid"), 50, "git", "ssh-connection", "publickey", true, "ssh-ed25519", []byte("k")})
-	sid, err := UserAuthSessionID(data)
-	if err != nil || string(sid) != "sid" {
-		t.Fatalf("got %q %v", sid, err)
+func TestParseUserAuth(t *testing.T) {
+	key := testKey(t)
+	host := testKey(t)
+	req := func(method string, extra ...[]byte) []byte {
+		b := ssh.Marshal(struct {
+			SessionID []byte
+			Type      byte
+			User      string
+			Service   string
+			Method    string
+			HasSig    bool
+			Algo      string
+			Key       []byte
+		}{[]byte("sid"), 50, "git", "ssh-connection", method, true, key.Type(), key.Marshal()})
+		for _, e := range extra {
+			b = append(b, ssh.Marshal(struct{ B []byte }{e})...)
+		}
+		return b
 	}
-	if _, err := UserAuthSessionID([]byte("arbitrary data to sign")); err == nil {
-		t.Fatal("arbitrary data accepted")
+
+	ua, err := ParseUserAuth(req("publickey"))
+	if err != nil || string(ua.SessionID) != "sid" || ua.User != "git" || !SameKey(ua.PublicKey, key) || ua.HostKey != nil {
+		t.Fatalf("publickey: %+v %v", ua, err)
 	}
+	// OpenSSH 8.9+ against servers that support it (GitHub): the method
+	// is publickey-hostbound-v00@openssh.com and the host key follows.
+	ua, err = ParseUserAuth(req("publickey-hostbound-v00@openssh.com", host.Marshal()))
+	if err != nil || !SameKey(ua.HostKey, host) || !SameKey(ua.PublicKey, key) {
+		t.Fatalf("hostbound: %+v %v", ua, err)
+	}
+
+	for name, data := range map[string][]byte{
+		"arbitrary data":          []byte("arbitrary data to sign"),
+		"password method":         req("password"),
+		"hostbound without host":  req("publickey-hostbound-v00@openssh.com"),
+		"publickey with trailing": req("publickey", host.Marshal()),
+		"hostbound bad host key":  req("publickey-hostbound-v00@openssh.com", []byte("junk")),
+	} {
+		if _, err := ParseUserAuth(data); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func testKey(t *testing.T) ssh.PublicKey {
+	t.Helper()
+	_, auth, err := Generate("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, _, _, _, err := ssh.ParseAuthorizedKey([]byte(auth))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
 }

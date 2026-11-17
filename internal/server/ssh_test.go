@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -82,8 +83,55 @@ func runSSH(sock, host string) (string, error) {
 	out, err := exec.Command("/usr/bin/ssh", "-F", "/dev/null",
 		"-o", "IdentityAgent="+sock, "-o", "IdentityFile=none", "-o", "BatchMode=yes",
 		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
-		"-p", port, "test@"+h, "echo").CombinedOutput()
+		"-p", port, currentUser()+"@"+h, "echo authenticated").CombinedOutput()
 	return string(out), err
+}
+
+func currentUser() string {
+	u, _ := user.Current()
+	return u.Username
+}
+
+// opensshServer runs the system's sshd as the current user on a free local
+// port, accepting authorized (an authorized_keys line). Unlike the Go test
+// server it supports publickey-hostbound-v00@openssh.com, which OpenSSH
+// clients use with servers that offer it (GitHub does).
+func opensshServer(t *testing.T, authorized string) string {
+	t.Helper()
+	if _, err := os.Stat("/usr/sbin/sshd"); err != nil {
+		t.Skip("no /usr/sbin/sshd")
+	}
+	dir := t.TempDir()
+	if out, err := exec.Command("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", filepath.Join(dir, "hostkey")).CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen: %v %s", err, out)
+	}
+	os.WriteFile(filepath.Join(dir, "authorized_keys"), []byte(authorized+"\n"), 0o600)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	cfg := fmt.Sprintf("Port %d\nListenAddress 127.0.0.1\nHostKey %s\nAuthorizedKeysFile %s\n"+
+		"PasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nStrictModes no\nPidFile %s\n",
+		port, filepath.Join(dir, "hostkey"), filepath.Join(dir, "authorized_keys"), filepath.Join(dir, "sshd.pid"))
+	os.WriteFile(filepath.Join(dir, "sshd_config"), []byte(cfg), 0o600)
+	// -D -e: stay in the foreground, so the test owns the process.
+	cmd := exec.Command("/usr/sbin/sshd", "-D", "-e", "-f", filepath.Join(dir, "sshd_config"))
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	for i := 0; i < 50; i++ {
+		if c, err := net.Dial("tcp", addr); err == nil {
+			c.Close()
+			return addr
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("sshd did not start")
+	return ""
 }
 
 // The real OpenSSH client authenticates through the agpass agent only to the
@@ -163,6 +211,19 @@ func TestSSHAgentWithOpenSSH(t *testing.T) {
 		t.Fatalf("ssh to a host without permission succeeded: %s", out)
 	}
 
+	// 4. A real OpenSSH server: the client signs with the host-bound
+	// method, which carries the server's host key.
+	openssh := opensshServer(t, auth)
+	if _, err := s.pinHost(ctx, c, openssh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.st.SSHGrant(c.session.ID, openssh, "test", ""); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runSSH(sock, openssh); err != nil || !strings.Contains(out, "authenticated") {
+		t.Fatalf("ssh to OpenSSH server failed: %v %s", err, out)
+	}
+
 	time.Sleep(200 * time.Millisecond)
 	for drained := false; !drained; {
 		select {
@@ -172,15 +233,21 @@ func TestSSHAgentWithOpenSSH(t *testing.T) {
 			drained = true
 		}
 	}
-	var signed, denied int
+	var signed, signedOpenSSH, denied int
 	for _, e := range logged {
 		if e.Action == "ssh-sign" && e.Level == events.LevelOK && e.Target == allowed {
 			signed++
+		}
+		if e.Action == "ssh-sign" && e.Level == events.LevelOK && e.Target == openssh {
+			signedOpenSSH++
 		}
 		if e.Action == "ssh-sign" && e.Level == events.LevelDeny {
 			denied++
 			t.Logf("denied: %s %s", e.Target, e.Msg)
 		}
+	}
+	if signedOpenSSH != 1 {
+		t.Errorf("want 1 signature for the OpenSSH server %s, got %d", openssh, signedOpenSSH)
 	}
 	if signed != 1 || denied < 1 {
 		t.Fatalf("want 1 signature for %s and a denial, got signed=%d denied=%d: %+v", allowed, signed, denied, logged)
