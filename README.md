@@ -44,6 +44,30 @@ agpass mint           # master password; prints agp-xxxx-xxxx (redeem within 10 
 
 Claude runs `agpass elevate agp-xxxx-xxxx` and has admin access for 1 hour.
 
+## SSH key for agents
+
+One shared SSH key, kept in the vault (`SYSTEM/ssh`), used by agents through
+agpass's SSH agent:
+
+```sh
+agpass ssh keygen        # or: agpass ssh import ~/.ssh/some_key; or in agpass setup
+agpass ssh key           # public key: add it on GitHub (ideally an account for agents) or servers
+```
+
+Agents run `agpass ssh allow --host github.com --reason "…"` (automatic for
+their repository's host; other hosts go to the gatekeeper), then
+`GIT_SSH_COMMAND="$(agpass ssh command)" git push`.
+
+- No session can read or replace the private key, not even an elevated one.
+- The agent signs only after the ssh client proves which server it talks to
+  (OpenSSH `session-bind@openssh.com`, verified with the server's host key)
+  and only for hosts the session is allowed. Host keys are pinned from the
+  network on first allow. Forwarded use is refused.
+- `agpass ssh command` ignores `~/.ssh/config`, so your own `IdentityFile`
+  entries can't slip in, and trusts only agpass's pinned `known_hosts`.
+- agpass sees the host, not the repository: a session allowed `github.com`
+  can push wherever that key can. Scope the key on GitHub's side.
+
 ## Instructions for agents
 
 `make install` also links the Claude Code skill
@@ -73,5 +97,6 @@ Everything runs as your user. That's deliberate for v1, and it means:
 - **An agent can lock you out for 5 minutes** by sending 5 wrong master passwords.
 - **A session covers everything Claude runs**, including test runners and package scripts.
 - **Any Claude process on this Mac can connect**, without your approval, and gets the folders linked to the repository it runs in.
+- **Your own SSH keys stay readable to agents** (`~/.ssh`, your ssh-agent): the agpass agent keeps well-behaved agents on the agpass key, it doesn't hide yours.
 - **The repository comes from `.git/config`**, which an agent can edit: setting another project's `origin` would get that project's folders. Fine against confusion, not against a determined agent.
 - **The LLM gatekeeper guards against confusion, not malice.** The reason it judges is written by the agent.

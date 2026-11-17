@@ -25,6 +25,10 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/mint", s.handle(authAdmin, s.mint))
 	mux.HandleFunc("POST /v1/elevate", s.handle(authSession, s.elevate))
 	mux.HandleFunc("POST /v1/connect", s.handle(authSession, s.connect))
+	mux.HandleFunc("POST /v1/ssh/keygen", s.handle(authAdmin, s.sshKeygen))
+	mux.HandleFunc("POST /v1/ssh/import", s.handle(authAdmin, s.sshImport))
+	mux.HandleFunc("GET /v1/ssh/key", s.handle(authSession, s.sshPubkey))
+	mux.HandleFunc("POST /v1/ssh/allow", s.handle(authSession, s.sshAllow))
 	mux.HandleFunc("GET /v1/whoami", s.handle(authSession, s.whoami))
 	mux.HandleFunc("GET /v1/list", s.handle(authSession, s.list))
 	mux.HandleFunc("GET /v1/item", s.handle(authSession, s.getItem))
@@ -96,6 +100,9 @@ func (s *Server) sessionInfo(sess *store.Session) (api.SessionInfo, error) {
 		until := sess.AdminUntil
 		info.AdminUntil = &until
 	}
+	if info.SSHHosts, err = s.st.SSHGrants(sess.ID); err != nil {
+		return api.SessionInfo{}, err
+	}
 	return info, nil
 }
 
@@ -164,11 +171,8 @@ func (s *Server) connect(r *http.Request, c *caller) (any, error) {
 			}
 			continue
 		}
-		writtenBy := "agent" // created or last edited by an agent session: untrusted
-		if f.UpdatedBy == "human" || f.UpdatedBy == "server" {
-			writtenBy = "owner"
-		}
-		candidates = append(candidates, llm.FolderInfo{Name: f.Name, Project: f.Project, Description: f.Description, Repos: f.Repos, WrittenBy: writtenBy})
+		// Folders created or last edited by an agent session are untrusted.
+		candidates = append(candidates, llm.FolderInfo{Name: f.Name, Project: f.Project, Description: f.Description, Repos: f.Repos, WrittenBy: writtenBy(f)})
 	}
 
 	// 2. A folder of its own for a repository that has none yet.
@@ -369,6 +373,15 @@ func (s *Server) grantSet(c *caller) (map[string]bool, error) {
 	return out, err
 }
 
+// sshKeyGuard keeps SYSTEM/ssh away from every session, elevated ones
+// included: the private key is only ever used through the agent socket.
+func sshKeyGuard(c *caller, folder, name string) error {
+	if !c.admin && folder == api.SystemFolder && name == SSHItem {
+		return errf(http.StatusForbidden, api.ErrForbidden, "%s/%s can only be used through the SSH agent (agpass ssh), never read or replaced by a session", api.SystemFolder, SSHItem)
+	}
+	return nil
+}
+
 func (s *Server) checkAccess(c *caller, folder string) error {
 	if c.full() {
 		return nil
@@ -439,6 +452,10 @@ func (s *Server) getItem(r *http.Request, c *caller) (any, error) {
 		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "get", Actor: c.String(), Target: path})
 		return nil, err
 	}
+	if err := sshKeyGuard(c, folder, name); err != nil {
+		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "get", Actor: c.String(), Target: path})
+		return nil, err
+	}
 	it, err := s.st.GetItem(folder, name)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, errf(http.StatusNotFound, api.ErrNotFound, "item %q not found", path)
@@ -467,6 +484,10 @@ func (s *Server) setItem(r *http.Request, c *caller) (any, error) {
 		return nil, err
 	}
 	if err := s.checkAccess(c, folder); err != nil {
+		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "set", Actor: c.String(), Target: req.Path})
+		return nil, err
+	}
+	if err := sshKeyGuard(c, folder, name); err != nil {
 		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "set", Actor: c.String(), Target: req.Path})
 		return nil, err
 	}

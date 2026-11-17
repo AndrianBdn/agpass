@@ -60,6 +60,7 @@ type Server struct {
 	masterMu sync.Mutex
 	inflight sync.WaitGroup // running handlers, drained before the store closes
 	ln       net.Listener
+	agent    agentState // SSH agent socket
 	resolver *peer.Resolver
 }
 
@@ -135,6 +136,10 @@ func (s *Server) Listen() error {
 		return err
 	}
 	s.ln = ln
+	if err := s.listenAgent(); err != nil {
+		ln.Close()
+		return err
+	}
 	return nil
 }
 
@@ -175,12 +180,16 @@ func (s *Server) Serve(ctx context.Context) error {
 			srv.Close()
 		}
 	}()
-	s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "listen", Target: sock, Msg: "agpass " + api.Version})
+	s.Log.Emit(events.Event{Level: events.LevelInfo, Action: "listen", Target: tilde(sock), Msg: "agpass " + api.Version})
+	agentDone := make(chan struct{})
+	go func() { s.serveAgent(); close(agentDone) }()
 	err := srv.Serve(ln)
 	if !errors.Is(err, http.ErrServerClosed) {
 		cancelReqs()
 	}
 	<-shutdownDone
+	s.stopAgent()
+	<-agentDone
 	// Handlers may still be running after Shutdown returns; give them a
 	// bounded time to notice the cancellation before the store closes.
 	drained := make(chan struct{})
@@ -304,7 +313,13 @@ func (s *Server) authenticate(r *http.Request, mode authMode) (*caller, error) {
 	if pi.err != nil || pi.pid == 0 {
 		return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "cannot identify peer process")
 	}
-	proc, agent, err := s.resolver.FindAgent(pi.pid)
+	return s.agentCaller(pi.pid)
+}
+
+// agentCaller finds the agent process above pid and its session, creating
+// the session on first use.
+func (s *Server) agentCaller(pid int) (*caller, error) {
+	proc, agent, err := s.resolver.FindAgent(pid)
 	if errors.Is(err, peer.ErrNoAgent) {
 		return nil, errf(http.StatusUnauthorized, api.ErrNeedAdmin, "not running under a recognised agent; use the master password")
 	}

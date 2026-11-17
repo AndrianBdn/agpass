@@ -9,11 +9,14 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	"agpass/internal/api"
 	"agpass/internal/client"
 	"agpass/internal/events"
 	"agpass/internal/llm"
 	"agpass/internal/server"
+	"agpass/internal/sshagent"
 	"agpass/internal/store"
 	"agpass/internal/vault"
 )
@@ -71,6 +74,29 @@ func cmdSetup(args []string) error {
 	}
 
 	fmt.Println()
+	fmt.Println(ui.bold("3. SSH key for agents"))
+	fmt.Println(ui.dim(wrap("One shared key that agents use through agpass's SSH agent, only for hosts they are "+
+		"allowed (git push to their repository's host, or servers the gatekeeper approves). The private key "+
+		"stays in the vault; you add the public key on GitHub or servers.", 78)))
+	fmt.Println()
+	fp, err := v.sshKeyFingerprint()
+	if err != nil {
+		return err
+	}
+	if fp != "" {
+		fmt.Println("An SSH key exists: " + fp + ". Replace it with `agpass ssh keygen --force`; show it with `agpass ssh key`.")
+	} else if askYesNo("Create an SSH key now?", false) {
+		k, err := v.generateSSH()
+		if err != nil {
+			return err
+		}
+		fmt.Println(ui.ok("SSH key created."))
+		printSSHKey(k)
+	} else {
+		fmt.Println(ui.dim("Skipped. Later: `agpass ssh keygen` or `agpass ssh import FILE`."))
+	}
+
+	fmt.Println()
 	if v.remote() {
 		msg := ui.ok("Done.")
 		if changed {
@@ -123,6 +149,8 @@ func setupGatekeeper(v setupVault) (bool, error) {
 type setupVault interface {
 	gatekeeperSet() (bool, error)
 	setGatekeeper(key string) error
+	sshKeyFingerprint() (string, error) // "" when there is no key
+	generateSSH() (api.SSHKeyResponse, error)
 	remote() bool
 	close()
 }
@@ -186,12 +214,31 @@ func (v *remoteVault) setGatekeeper(key string) error {
 	return v.c.Do("POST", "/v1/item", nil, req, nil)
 }
 
+func (v *remoteVault) sshKeyFingerprint() (string, error) {
+	var k api.SSHKeyResponse
+	err := v.c.Do("GET", "/v1/ssh/key", nil, nil, &k)
+	var ae *api.Error
+	if errors.As(err, &ae) && ae.Code == api.ErrNotFound {
+		return "", nil
+	}
+	return k.Fingerprint, err
+}
+
+func (v *remoteVault) generateSSH() (api.SSHKeyResponse, error) {
+	var k api.SSHKeyResponse
+	err := v.c.Do("POST", "/v1/ssh/keygen", nil, api.SSHKeyRequest{}, &k)
+	return k, err
+}
+
 func (v *remoteVault) remote() bool { return true }
 func (v *remoteVault) close()       {}
 
 // ---- directly on disk (server not running) ----
 
-type localVault struct{ st *store.Store }
+type localVault struct {
+	st  *store.Store
+	dir string
+}
 
 func createLocalVault(dir string) (setupVault, error) {
 	fmt.Println("No vault yet. Choose a master password: it protects every secret and cannot be recovered.")
@@ -226,7 +273,7 @@ func createLocalVault(dir string) (setupVault, error) {
 	}
 	st.AddEvent(events.Event{Time: time.Now(), Level: events.LevelOK, Action: "setup", Actor: "human", Msg: "new vault created"})
 	fmt.Println(ui.ok("Vault created."))
-	return &localVault{st: st}, nil
+	return &localVault{st: st, dir: dir}, nil
 }
 
 func openLocalVault(dir string) (setupVault, error) {
@@ -252,7 +299,7 @@ func openLocalVault(dir string) (setupVault, error) {
 			return nil, err
 		}
 		fmt.Println(ui.ok("Unlocked."))
-		return &localVault{st: st}, nil
+		return &localVault{st: st, dir: dir}, nil
 	}
 }
 
@@ -276,6 +323,49 @@ func (v *localVault) setGatekeeper(key string) error {
 	v.st.AddEvent(events.Event{Time: time.Now(), Level: events.LevelOK, Action: "set", Actor: "human",
 		Target: api.SystemFolder + "/" + server.GatekeeperItem, Msg: fmt.Sprintf("v%d set=api_key (setup)", it.Version)})
 	return nil
+}
+
+func (v *localVault) sshKeyFingerprint() (string, error) {
+	it, err := v.st.GetItem(api.SystemFolder, server.SSHItem)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	for _, f := range it.Fields {
+		if f.Key == "private_key" {
+			signer, err := sshagent.Signer([]byte(f.Value))
+			if err != nil {
+				return "", err
+			}
+			return ssh.FingerprintSHA256(signer.PublicKey()), nil
+		}
+	}
+	return "", nil
+}
+
+func (v *localVault) generateSSH() (api.SSHKeyResponse, error) {
+	host, _ := os.Hostname()
+	priv, auth, err := sshagent.Generate("agpass@" + strings.TrimSuffix(host, ".local"))
+	if err != nil {
+		return api.SSHKeyResponse{}, err
+	}
+	fields := []api.Field{
+		{Key: "private_key", Type: api.TypeSensitive, Value: string(priv)},
+		{Key: "public_key", Type: api.TypeText, Value: auth},
+	}
+	if _, err := v.st.SetItem(api.SystemFolder, server.SSHItem, fields, nil, "human"); err != nil {
+		return api.SSHKeyResponse{}, err
+	}
+	signer, err := sshagent.Signer(priv)
+	if err != nil {
+		return api.SSHKeyResponse{}, err
+	}
+	fp := ssh.FingerprintSHA256(signer.PublicKey())
+	v.st.AddEvent(events.Event{Time: time.Now(), Level: events.LevelWarn, Action: "ssh-key", Actor: "human",
+		Target: api.SystemFolder + "/" + server.SSHItem, Msg: "generated " + fp + " (setup)"})
+	return api.SSHKeyResponse{PublicKey: auth, Fingerprint: fp, Socket: server.AgentSocketPath(v.dir)}, nil
 }
 
 func (v *localVault) remote() bool { return false }

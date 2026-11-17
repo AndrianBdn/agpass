@@ -109,6 +109,43 @@ type Grant struct {
 	At          time.Time `json:"at"`
 }
 
+// SSHGrant lets a session use the SSH key for one host.
+type SSHGrant struct {
+	Host        string    `json:"host"`
+	By          string    `json:"by"`
+	Explanation string    `json:"explanation,omitempty"`
+	At          time.Time `json:"at"`
+}
+
+// SSHAllowRequest is the body of POST /v1/ssh/allow.
+type SSHAllowRequest struct {
+	Host   string `json:"host"`
+	Reason string `json:"reason"`
+}
+
+// SSHAllowResponse answers POST /v1/ssh/allow.
+type SSHAllowResponse struct {
+	Host        string   `json:"host"`
+	Granted     bool     `json:"granted"`
+	By          string   `json:"by,omitempty"`
+	Explanation string   `json:"explanation,omitempty"`
+	HostKeys    []string `json:"host_keys,omitempty"` // fingerprints pinned for the host
+}
+
+// SSHKeyRequest is the body of POST /v1/ssh/keygen and /v1/ssh/import.
+type SSHKeyRequest struct {
+	PrivateKey string `json:"private_key,omitempty"` // import: OpenSSH PEM, unencrypted
+	Comment    string `json:"comment,omitempty"`
+	Force      bool   `json:"force,omitempty"` // replace an existing key
+}
+
+// SSHKeyResponse describes the agent key.
+type SSHKeyResponse struct {
+	PublicKey   string `json:"public_key"` // authorized_keys line
+	Fingerprint string `json:"fingerprint"`
+	Socket      string `json:"socket"`
+}
+
 type SessionInfo struct {
 	ID         string     `json:"id"`
 	Agent      string     `json:"agent"`
@@ -120,6 +157,7 @@ type SessionInfo struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	Grants     []Grant    `json:"grants"`
 	AdminUntil *time.Time `json:"admin_until,omitempty"` // set while elevated
+	SSHHosts   []SSHGrant `json:"ssh_hosts,omitempty"`
 }
 
 type WhoamiResponse struct {

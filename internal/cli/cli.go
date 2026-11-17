@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	stdlog "log"
 	"net/url"
 	"os"
 	"os/signal"
@@ -56,6 +58,12 @@ Agent (run inside Claude Code; each Claude process gets its own session automati
   agpass folder create NAME --project P [--desc D]   (agents: linked to their own repository)
   agpass folder edit NAME [--project P] [--desc D] [--repo R ...]
 
+SSH agent (one shared key, used through agpass; see agpass ssh help):
+  agpass ssh keygen | import FILE  create or import the key (human)
+  agpass ssh key                   public key to add on GitHub or servers
+  agpass ssh allow --host H --reason R   let this session use the key for host H
+  GIT_SSH_COMMAND="$(agpass ssh command)" git push
+
 Data: $AGPASS_DIR, else $XDG_DATA_HOME/agpass, else ~/.local/share/agpass
 `
 
@@ -65,12 +73,16 @@ func Run(args []string) int {
 		return 0
 	}
 	cmd, rest := args[0], args[1:]
-	if cmd == "folder" {
-		if len(rest) == 0 {
+	if cmd == "folder" || cmd == "ssh" {
+		if len(rest) == 0 || rest[0] == "help" || rest[0] == "-h" || rest[0] == "--help" {
+			if cmd == "ssh" {
+				fmt.Print(sshUsage)
+				return 0
+			}
 			fmt.Fprint(os.Stderr, "usage: agpass folder create|edit NAME ...\n")
 			return 2
 		}
-		cmd, rest = "folder "+rest[0], rest[1:]
+		cmd, rest = cmd+" "+rest[0], rest[1:]
 	}
 	fn, ok := commands[cmd]
 	if !ok {
@@ -93,6 +105,11 @@ func init() {
 	commands = map[string]func([]string) error{
 		"serve":         cmdServe,
 		"setup":         cmdSetup,
+		"ssh keygen":    cmdSSHKeygen,
+		"ssh import":    cmdSSHImport,
+		"ssh key":       cmdSSHKey,
+		"ssh allow":     cmdSSHAllow,
+		"ssh command":   cmdSSHCommand,
 		"mint":          cmdMint,
 		"elevate":       cmdElevate,
 		"connect":       cmdConnect,
@@ -204,6 +221,10 @@ func cmdServe(args []string) error {
 		return err
 	}
 	unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{}) // no core dumps of decrypted memory
+	// Libraries (net/http, the SSH agent) report errors through the standard
+	// logger; agpass reports through its event log, and stray lines would
+	// draw over the dashboard.
+	stdlog.SetOutput(io.Discard)
 
 	dir := dataDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -441,6 +462,12 @@ func cmdWhoami(args []string) error {
 		fmt.Printf("repo %s · cwd %s\n", orDash(clean(s.Repo)), clean(s.Cwd))
 	}
 	printGrants(s.Grants)
+	if len(s.SSHHosts) > 0 {
+		fmt.Println("SSH:")
+		for _, g := range s.SSHHosts {
+			fmt.Printf("  %-20s %s\n", clean(g.Host), clean(g.By))
+		}
+	}
 	return nil
 }
 

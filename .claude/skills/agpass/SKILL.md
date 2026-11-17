@@ -1,6 +1,6 @@
 ---
 name: agpass
-description: Get secrets (passwords, API keys, tokens, database URLs, credentials) from agpass, the user's local secrets broker, and store new ones there. Use whenever a command, test, script or dev server needs a credential, instead of .env files, hardcoding or asking the user to paste it; when the user says "connect to agpass", asks to set up secrets for a project, or gives an agp-xxxx-xxxx admin code; or when an agpass command fails with "no access to folder" or "server is not running".
+description: Get secrets (passwords, API keys, tokens, database URLs, credentials) and SSH access (git push over ssh, ssh to servers) from agpass, the user's local secrets broker, and store new ones there. Use whenever a command, test, script or dev server needs a credential, instead of .env files, hardcoding or asking the user to paste it; when the user says "connect to agpass", asks to set up secrets for a project, or gives an agp-xxxx-xxxx admin code; or when an agpass command fails with "no access to folder" or "server is not running".
 ---
 
 # agpass: secrets for this agent session
@@ -114,11 +114,36 @@ other repositories. Write descriptions for the user and the gatekeeper: what
 the secrets are and which project uses them. Never put instructions or access
 policy in them.
 
+## SSH (git push, servers)
+
+agpass has one shared SSH key for agents. You never see it: ssh authenticates
+through agpass's agent, which signs only for hosts this session is allowed.
+
+```sh
+agpass ssh allow --host github.com --reason "push the login fix to acme/crm"
+GIT_SSH_COMMAND="$(agpass ssh command)" git push
+$(agpass ssh command) deploy@server.example.com -p 2222 'systemctl status app'
+```
+
+- The host of this session's repository is allowed automatically; other hosts
+  go to the gatekeeper with your reason. A denial: tell the user, don't retry.
+- `agpass ssh command` ignores `~/.ssh/config` (so only the agpass key is used)
+  and accepts only hosts pinned by `ssh allow`. Use real host names, users and
+  ports, not aliases from the user's ssh config.
+- Never use the user's own keys (`~/.ssh/id_*`, their ssh-agent) for work
+  agpass should cover, and never forward the agent (`-A`).
+- "Permission denied (publickey)" after a grant means the agpass public key is
+  not on that account or server yet: tell the user to add the output of
+  `agpass ssh key`.
+
 ## Reference
 
 | Command | Notes |
 |---|---|
-| `agpass whoami [--json]` | session, repository, granted folders, admin expiry |
+| `agpass whoami [--json]` | session, repository, granted folders and SSH hosts, admin expiry |
+| `agpass ssh allow --host H --reason R` | let this session use the SSH key for H |
+| `agpass ssh command` | ssh command line using only the agpass key; for `GIT_SSH_COMMAND` |
+| `agpass ssh key` | the public key (for the user to add on GitHub / servers) |
 | `agpass elevate CODE` | admin access for 1 hour, with a code the user minted |
 | `agpass connect --reason R [--folder F] [--create [--name N] [--desc D]] [--json]` | get this repository's folders; `--create` makes one if none |
 | `agpass list [folder] [--json]` | no values |

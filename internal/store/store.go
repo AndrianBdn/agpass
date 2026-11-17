@@ -93,6 +93,24 @@ CREATE TABLE IF NOT EXISTS grants (
 	PRIMARY KEY (session_id, folder)
 );
 
+-- Hosts a session may use the SSH key for.
+CREATE TABLE IF NOT EXISTS ssh_grants (
+	session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+	host        TEXT NOT NULL,
+	granted_by  TEXT NOT NULL,
+	explanation TEXT NOT NULL DEFAULT '',
+	at          TEXT NOT NULL,
+	PRIMARY KEY (session_id, host)
+);
+
+-- Host keys pinned when a host was first allowed (authorized_keys format).
+CREATE TABLE IF NOT EXISTS ssh_hosts (
+	host     TEXT NOT NULL,
+	key      TEXT NOT NULL,
+	added_at TEXT NOT NULL,
+	PRIMARY KEY (host, key)
+);
+
 -- Audit log. Not counted in the generation: a read is logged too, and
 -- appending must stay cheap.
 CREATE TABLE IF NOT EXISTS events (
@@ -579,6 +597,104 @@ func (s *Store) Grant(sessionID, folder, by, explanation string) (api.Grant, err
 		return err
 	})
 	return g, err
+}
+
+// ---- ssh ----
+
+func (s *Store) SSHGrant(sessionID, host, by, explanation string) (api.SSHGrant, error) {
+	g := api.SSHGrant{Host: host, By: by, Explanation: explanation, At: time.Now()}
+	err := s.write(func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT OR IGNORE INTO ssh_grants (session_id, host, granted_by, explanation, at) VALUES (?, ?, ?, ?, ?)`,
+			sessionID, host, by, explanation, ts(g.At))
+		return err
+	})
+	return g, err
+}
+
+func (s *Store) SSHGrants(sessionID string) ([]api.SSHGrant, error) {
+	rows, err := s.db.Query(`SELECT host, granted_by, explanation, at FROM ssh_grants WHERE session_id=? ORDER BY host`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []api.SSHGrant{}
+	for rows.Next() {
+		var g api.SSHGrant
+		var at string
+		if err := rows.Scan(&g.Host, &g.By, &g.Explanation, &at); err != nil {
+			return nil, err
+		}
+		g.At = parseTS(at)
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// PinHostKeys records keys (authorized_keys format) for host.
+func (s *Store) PinHostKeys(host string, keys []string) error {
+	now := ts(time.Now())
+	return s.write(func(tx *sql.Tx) error {
+		for _, k := range keys {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO ssh_hosts (host, key, added_at) VALUES (?, ?, ?)`, host, k, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// HostKeys returns the pinned keys of host.
+func (s *Store) HostKeys(host string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT key FROM ssh_hosts WHERE host=? ORDER BY key`, host)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// AllHostKeys returns every pinned (host, key) pair.
+func (s *Store) AllHostKeys() ([][2]string, error) {
+	rows, err := s.db.Query(`SELECT host, key FROM ssh_hosts ORDER BY host, key`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][2]string
+	for rows.Next() {
+		var h, k string
+		if err := rows.Scan(&h, &k); err != nil {
+			return nil, err
+		}
+		out = append(out, [2]string{h, k})
+	}
+	return out, rows.Err()
+}
+
+// HostsForKey returns the hosts that key (authorized_keys format) is pinned for.
+func (s *Store) HostsForKey(key string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT host FROM ssh_hosts WHERE key=? ORDER BY host`, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }
 
 // ---- events ----
