@@ -48,6 +48,33 @@ What it protects against:
 | Nobody notices what happened | Every request, grant and denial goes to an encrypted audit log, live on the `serve` dashboard. |
 | Secrets at rest | The database is encrypted with a key wrapped by your master password (Argon2id). |
 
+### While you are away
+
+agpass is built to run unattended, with the Mac locked. In that state, even a
+capable agent has no simple way to get at the vault without going through
+agpass's rules:
+
+- **The files are useless without the master password.** `agpass.db` is
+  encrypted (Adiantum) with a random key, and `agpass.key` wraps that key
+  with the master password through Argon2id (128 MiB, 3 passes). A copied
+  vault means an offline guessing attack on the master password, so use a
+  strong one (at least 10 characters is enforced).
+- **The master password isn't stored anywhere agpass can read.** You type
+  it when `serve` starts, or 1Password supplies it behind Touch ID.
+- **The server's memory can't be read.** The binary runs with the hardened
+  runtime: debuggers can't attach (`lldb -p` is refused, while it attaches
+  to the same binary built without it), dylibs can't be injected, and core
+  dumps are off. A program the agent compiles can't get the server's task
+  port at all. This assumes the agent has no root (no passwordless `sudo`).
+- **Admin access needs you.** Minting a code takes the master password or
+  your Touch ID.
+
+What an agent *can* still do is work within agpass's rules in ways they don't
+foresee: the main one is editing `.git/config` to look like another
+repository and get its folders. Those are listed under
+[Known limits](#known-limits-v1), along with what takes effect only after
+you come back (a replaced binary capturing the password at the next `serve`).
+
 What it trusts: you, the agpass binary, the macOS kernel's process and code
 signing information, and Claude Code's Anthropic signature. The gatekeeper
 (OpenAI) sees folder names, descriptions and the agent's reason, never secret
