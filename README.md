@@ -14,7 +14,7 @@ make install          # builds, signs with hardened runtime, installs to ~/.loca
 ## Use
 
 ```sh
-agpass setup          # once: creates the vault (master password), optionally adds an OpenAI key for the gatekeeper
+agpass setup          # once: creates the vault (master password); optional: OpenAI key for the gatekeeper, SSH key, 1Password
 agpass serve          # in a terminal tab: asks for the master password, then shows the live event log
 ```
 
@@ -22,6 +22,34 @@ agpass serve          # in a terminal tab: asks for the master password, then sh
 time to replace the key; it works with the server running or stopped.
 The dashboard is view-only: `↑↓`/`j k` scroll, `g`/`G` top/bottom, `/` filter,
 `q` twice stops the server. History is kept for 90 days.
+
+### Master password from 1Password
+
+agpass can read the master password with the 1Password CLI (`op`) instead of
+asking: `serve`, `setup`, `mint`, `ssh keygen`/`import` and any command run
+with `--admin`. Set it up with `agpass setup` (step 4): it asks for the
+1Password account and item, checks that the item unlocks this vault, and
+saves the config. Running setup again re-checks it. Or write it yourself in
+`~/.config/agpass/config.toml`
+(`$XDG_CONFIG_HOME/agpass/config.toml`, or `config.toml` in `$AGPASS_DIR`
+when that is set):
+
+```toml
+[onepassword]
+master_password = "op://Private/AgPass/password"  # secret reference, or an item name/ID (its "password" field)
+account = "my.1password.com"                      # optional: which account, if op is signed in to several
+```
+
+`op` asks you to approve (Touch ID with the desktop app integration). If it
+fails or the password is wrong, the command asks you to type it (or fails
+without a terminal). `--manual` on any command skips 1Password. With
+1Password configured, `serve` also starts without a terminal (log lines
+instead of the dashboard).
+
+An agent that runs `agpass mint` also triggers the 1Password prompt: approve
+only what you started. Once approved, `op` may stay unlocked for that
+terminal session for a while (1Password's setting), so later requests from
+the same place may not prompt again; every mint shows on the dashboard.
 
 Set up folders and secrets yourself (any command run outside an agent asks for
 the master password):

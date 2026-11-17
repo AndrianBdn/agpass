@@ -11,6 +11,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/spf13/pflag"
+
 	"agpass/internal/api"
 	"agpass/internal/client"
 	"agpass/internal/events"
@@ -28,8 +30,13 @@ import (
 // When the server is running, setup talks to it with the master password;
 // otherwise it opens the vault files directly.
 func cmdSetup(args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("usage: agpass setup")
+	fs := pflag.NewFlagSet("setup", pflag.ContinueOnError)
+	addManualFlag(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("usage: agpass setup [--manual]")
 	}
 	if !isTTY(os.Stdin) {
 		return fmt.Errorf("agpass setup is interactive: run it in a terminal")
@@ -94,6 +101,15 @@ func cmdSetup(args []string) error {
 		printSSHKey(k)
 	} else {
 		fmt.Println(ui.dim("Skipped. Later: `agpass ssh keygen` or `agpass ssh import FILE`."))
+	}
+
+	fmt.Println()
+	fmt.Println(ui.bold("4. Master password from 1Password"))
+	fmt.Println(ui.dim(wrap("Optional: agpass reads the master password with the 1Password CLI (op) instead of asking, "+
+		"for serve, mint and other admin commands. op may ask you to approve (Touch ID).", 78)))
+	fmt.Println()
+	if err := setupOnePassword(dir); err != nil {
+		return err
 	}
 
 	fmt.Println()
@@ -174,7 +190,7 @@ type remoteVault struct{ c *client.Client }
 
 func openRemoteVault(sock string) (setupVault, error) {
 	for tries := 0; ; tries++ {
-		pw, err := readPassword("Master password: ")
+		pw, fromOP, err := nextMasterPassword(tries)
 		if err != nil {
 			return nil, err
 		}
@@ -189,7 +205,9 @@ func openRemoteVault(sock string) (setupVault, error) {
 		if !errors.As(err, &ae) || ae.Code != api.ErrForbidden || tries == 2 {
 			return nil, err
 		}
-		fmt.Println("Wrong password.")
+		if err := wrongPassword(fromOP); err != nil {
+			return nil, err
+		}
 	}
 }
 
@@ -282,13 +300,15 @@ func openLocalVault(dir string) (setupVault, error) {
 		return nil, err
 	}
 	for tries := 0; ; tries++ {
-		pw, err := readPassword("Master password: ")
+		pw, fromOP, err := nextMasterPassword(tries)
 		if err != nil {
 			return nil, err
 		}
 		dek, err := kf.Unwrap(pw)
 		if errors.Is(err, vault.ErrWrongPassword) && tries < 2 {
-			fmt.Println("Wrong password.")
+			if err := wrongPassword(fromOP); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if err != nil {

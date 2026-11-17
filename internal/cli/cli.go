@@ -23,6 +23,7 @@ import (
 
 	"agpass/internal/api"
 	"agpass/internal/client"
+	"agpass/internal/config"
 	"agpass/internal/dashboard"
 	"agpass/internal/events"
 	"agpass/internal/server"
@@ -34,11 +35,13 @@ const usage = `agpass — local secrets broker for AI agents
 Human:
   agpass setup                     create the vault and configure the LLM gatekeeper (interactive)
   agpass serve                     run the server in a terminal tab: asks for the master
-                                   password, then shows the live event log
+                                   password (or reads it from 1Password, see Config), then
+                                   shows the live event log
   agpass mint                      one-time code that gives one Claude session admin access
                                    (all folders incl. SYSTEM) for 1 hour
   Any command below also works for the human: it asks for the master password
-  (or pass --admin).
+  (or pass --admin). With 1Password in the config, agpass reads it from there;
+  --manual types it instead.
 
 Agent (run inside Claude Code; each Claude process gets its own session automatically):
   agpass connect --reason "what you work on and why you need secrets"
@@ -65,6 +68,8 @@ SSH agent (one shared key, used through agpass; see agpass ssh help):
   GIT_SSH_COMMAND="$(agpass ssh command)" git push
 
 Data: $AGPASS_DIR, else $XDG_DATA_HOME/agpass, else ~/.local/share/agpass
+Config: $AGPASS_DIR/config.toml, else $XDG_CONFIG_HOME/agpass/config.toml,
+        else ~/.config/agpass/config.toml (optional; see README)
 `
 
 func Run(args []string) int {
@@ -142,39 +147,69 @@ func dataDir() string {
 func flags(name string) (*pflag.FlagSet, *bool) {
 	fs := pflag.NewFlagSet(name, pflag.ContinueOnError)
 	admin := fs.Bool("admin", false, "authenticate with the master password")
+	addManualFlag(fs)
 	return fs, admin
 }
 
 type conn struct {
 	*client.Client
+	fromOP bool // Master came from 1Password
 }
 
 func newConn(admin bool) (*conn, error) {
-	c := &conn{client.New(server.SocketPath(dataDir()))}
+	c := &conn{Client: client.New(server.SocketPath(dataDir()))}
 	if admin {
-		pw, err := readPassword("Master password: ")
-		if err != nil {
+		if err := c.login(); err != nil {
 			return nil, err
 		}
-		c.Master = pw
 	}
 	return c, nil
 }
 
-// call retries once with the master password when the server says the
-// caller is not an agent and we are talking to a human at a terminal.
+func (c *conn) login() error {
+	pw, fromOP, err := masterPassword()
+	if err != nil {
+		return err
+	}
+	c.Master, c.fromOP = pw, fromOP
+	return nil
+}
+
+// call retries with the master password when the server says the caller is
+// not an agent, and we can get it (1Password, or a human at a terminal); and
+// once more, typed, when the server rejects the one from 1Password.
 func (c *conn) call(method, path string, q url.Values, body, out any) error {
 	err := c.Do(method, path, q, body, out)
-	var ae *api.Error
-	if errors.As(err, &ae) && ae.Code == api.ErrNeedAdmin && c.Master == "" && isTTY(os.Stdin) {
+	if c.Master == "" && apiCode(err) == api.ErrNeedAdmin && (isTTY(os.Stdin) || onePasswordSet()) {
+		if err := c.login(); err != nil {
+			return err
+		}
+		err = c.Do(method, path, q, body, out)
+	}
+	if c.fromOP && isWrongMaster(err) {
+		if werr := wrongPassword(true); werr != nil {
+			return werr
+		}
 		pw, perr := readPassword("Master password: ")
 		if perr != nil {
 			return perr
 		}
-		c.Master = pw
-		return c.Do(method, path, q, body, out)
+		c.Master, c.fromOP = pw, false
+		err = c.Do(method, path, q, body, out)
 	}
 	return err
+}
+
+func apiCode(err error) string {
+	var ae *api.Error
+	if errors.As(err, &ae) {
+		return ae.Code
+	}
+	return ""
+}
+
+func isWrongMaster(err error) bool {
+	return apiCode(err) == api.ErrForbidden && strings.Contains(err.Error(), "wrong master password")
 }
 
 func isTTY(f *os.File) bool { return term.IsTerminal(int(f.Fd())) }
@@ -217,9 +252,15 @@ func cmdServe(args []string) error {
 	fs := pflag.NewFlagSet("serve", pflag.ContinueOnError)
 	rollback := fs.Bool("accept-rollback", false, "open a database older than the last one seen")
 	pwStdin := fs.Bool("password-stdin", false, "read the master password from stdin (no dashboard; log lines on stdout)")
+	addManualFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	op, err := onePasswordConfig()
+	if err != nil {
+		return err
+	}
+	onePassword := op.MasterPassword != "" && !*pwStdin
 	unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{}) // no core dumps of decrypted memory
 	// Libraries (net/http, the SSH agent) report errors through the standard
 	// logger; agpass reports through its event log, and stray lines would
@@ -239,8 +280,11 @@ func cmdServe(args []string) error {
 		fmt.Print("\x1b[22;0t\x1b]0;" + serveTitle + "\x07")
 		defer fmt.Print("\x1b]0;\x07\x1b[23;0t")
 	}
-	if !interactive && !*pwStdin {
-		return fmt.Errorf("run `agpass serve` in a terminal, or pass --password-stdin")
+	if !interactive && manualPassword {
+		return fmt.Errorf("--manual needs a terminal to type the password in (or pass --password-stdin)")
+	}
+	if !interactive && !*pwStdin && !onePassword {
+		return fmt.Errorf("run `agpass serve` in a terminal, pass --password-stdin, or set [onepassword] in %s", tildePath(config.Path()))
 	}
 	// The dashboard shows events itself; without it, print them as lines.
 	log := events.New(nil, false)
@@ -255,20 +299,9 @@ func cmdServe(args []string) error {
 	switch {
 	case newVault:
 		return fmt.Errorf("no vault in %s yet: run `agpass setup` first", tildePath(dir))
-	case interactive:
-		for tries := 0; ; tries++ {
-			pw, err := readPassword("Master password: ")
-			if err != nil {
-				return err
-			}
-			err = srv.Unlock(pw)
-			if err == nil {
-				break
-			}
-			if !errors.Is(err, vault.ErrWrongPassword) || tries == 2 {
-				return err
-			}
-			fmt.Println("Wrong password.")
+	case interactive || onePassword:
+		if err := unlockServer(srv); err != nil {
+			return err
 		}
 	default:
 		pw, err := readPassword("")
@@ -307,6 +340,27 @@ func cmdServe(args []string) error {
 		return derr
 	}
 	return serr
+}
+
+// unlockServer unlocks the vault with the master password from 1Password or
+// typed, up to three tries.
+func unlockServer(srv *server.Server) error {
+	for tries := 0; ; tries++ {
+		pw, fromOP, err := nextMasterPassword(tries)
+		if err != nil {
+			return err
+		}
+		err = srv.Unlock(pw)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, vault.ErrWrongPassword) || tries == 2 {
+			return err
+		}
+		if err := wrongPassword(fromOP); err != nil {
+			return err
+		}
+	}
 }
 
 // serveTitle is the terminal tab/window title while `agpass serve` runs.
@@ -386,6 +440,7 @@ func cmdConnect(args []string) error {
 
 func cmdMint(args []string) error {
 	fs := pflag.NewFlagSet("mint", pflag.ContinueOnError)
+	addManualFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
