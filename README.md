@@ -219,9 +219,13 @@ agpass ssh keygen        # or: agpass ssh import ~/.ssh/some_key; or in agpass s
 agpass ssh key           # public key: add it on GitHub (ideally an account for agents) or servers
 ```
 
-Agents run `agpass ssh allow --host github.com --reason "…"` (automatic for
-their repository's host; other hosts go to the gatekeeper), then
-`GIT_SSH_COMMAND="$(agpass ssh command)" git push`.
+Agents run `agpass ssh allow --host github.com --reason "…"`, then
+`GIT_SSH_COMMAND="$(agpass ssh command)" git push`. Their repository's host is
+allowed automatically. Other hosts go to the gatekeeper, which is permissive
+here: any concrete reason that fits the project passes, and it reads
+agent-written folder descriptions as evidence of the project's servers. The
+key only logs in where you installed its public key, so that is the real
+limit.
 
 - No session can read or replace the private key, not even an elevated one.
 - The agent signs only after the ssh client proves which server it talks to
