@@ -70,10 +70,12 @@ func (s *Server) writeKnownHosts() error {
 }
 
 type agentState struct {
-	mu    sync.Mutex
-	ln    net.Listener
-	conns map[net.Conn]struct{}
-	khMu  sync.Mutex // serializes writeKnownHosts
+	mu     sync.Mutex
+	ln     net.Listener
+	conns  map[net.Conn]struct{}
+	closed bool           // stopAgent ran: no new connections
+	wg     sync.WaitGroup // connections being served
+	khMu   sync.Mutex     // serializes writeKnownHosts
 }
 
 func (s *Server) listenAgent() error {
@@ -103,9 +105,16 @@ func (s *Server) serveAgent() {
 			return
 		}
 		s.agent.mu.Lock()
+		if s.agent.closed { // accepted while stopAgent was closing the others
+			s.agent.mu.Unlock()
+			conn.Close()
+			continue
+		}
 		s.agent.conns[conn] = struct{}{}
+		s.agent.wg.Add(1)
 		s.agent.mu.Unlock()
 		go func() {
+			defer s.agent.wg.Done()
 			defer func() {
 				s.agent.mu.Lock()
 				delete(s.agent.conns, conn)
@@ -118,9 +127,12 @@ func (s *Server) serveAgent() {
 	}
 }
 
+// stopAgent closes the listener and every connection. Serve then waits for
+// agent.wg, so no connection is still using the store when it closes.
 func (s *Server) stopAgent() {
 	s.agent.ln.Close()
 	s.agent.mu.Lock()
+	s.agent.closed = true
 	for c := range s.agent.conns {
 		c.Close()
 	}
@@ -448,6 +460,34 @@ func (s *Server) sshAllow(r *http.Request, c *caller) (any, error) {
 	resp.Granted, resp.HostKeys = true, pinned
 	s.Log.Emit(events.Event{Level: events.LevelOK, Action: "ssh-allow", Actor: c.String(), Target: host, Msg: resp.By + ": " + truncate(req.Reason, 80)})
 	return resp, nil
+}
+
+// sshUnpin forgets a host's pinned keys, for when the host changed them (a
+// rotation, a rebuilt server). The next `ssh allow` for the host pins what it
+// serves then. Only the human does this: trusting a changed host key is the
+// decision pinning exists for.
+func (s *Server) sshUnpin(r *http.Request, c *caller) (any, error) {
+	var req api.SSHUnpinRequest
+	if err := decode(r, &req); err != nil {
+		return nil, err
+	}
+	host, err := sshagent.NormalizeHost(req.Host)
+	if err != nil {
+		return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "%v", err)
+	}
+	n, err := s.st.UnpinHost(host)
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, errf(http.StatusNotFound, api.ErrNotFound, "no host keys are pinned for %s", host)
+	}
+	if err := s.writeKnownHosts(); err != nil {
+		return nil, err
+	}
+	s.Log.Emit(events.Event{Level: events.LevelWarn, Action: "ssh-unpin", Actor: c.String(), Target: host,
+		Msg: fmt.Sprintf("forgot %d host keys; the next ssh allow pins the host again", n)})
+	return api.SSHUnpinResponse{Host: host, Removed: n}, nil
 }
 
 // pinHost returns the fingerprints of host's pinned keys, fetching and

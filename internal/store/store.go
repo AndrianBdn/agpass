@@ -332,21 +332,19 @@ func (s *Store) CreateFolder(req api.FolderRequest, actor string) error {
 	})
 }
 
-func (s *Store) UpdateFolder(req api.FolderRequest, actor string) (api.Folder, error) {
+// UpdateFolder applies edit to the folder's project, description and repos.
+// edit runs inside the write transaction, so concurrent edits (two sessions
+// each linking their repository) apply one after the other.
+func (s *Store) UpdateFolder(name, actor string, edit func(f *api.Folder)) (api.Folder, error) {
 	var f api.Folder
 	err := s.write(func(tx *sql.Tx) error {
 		var err error
-		if f, err = getFolder(tx, req.Name); err != nil {
+		if f, err = getFolder(tx, name); err != nil {
 			return err
 		}
-		if req.Project != nil {
-			f.Project = *req.Project
-		}
-		if req.Description != nil {
-			f.Description = *req.Description
-		}
-		if req.Repos != nil {
-			f.Repos = *req.Repos
+		edit(&f)
+		if f.Repos == nil {
+			f.Repos = []string{}
 		}
 		repos, _ := json.Marshal(f.Repos)
 		now := time.Now()
@@ -641,6 +639,20 @@ func (s *Store) PinHostKeys(host string, keys []string) error {
 		}
 		return nil
 	})
+}
+
+// UnpinHost forgets the pinned keys of host and reports how many there were.
+func (s *Store) UnpinHost(host string) (int, error) {
+	var n int64
+	err := s.write(func(tx *sql.Tx) error {
+		res, err := tx.Exec(`DELETE FROM ssh_hosts WHERE host=?`, host)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	return int(n), err
 }
 
 // HostKeys returns the pinned keys of host.

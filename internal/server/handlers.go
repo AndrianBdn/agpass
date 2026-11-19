@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"agpass/internal/api"
 	"agpass/internal/events"
@@ -29,6 +30,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/ssh/import", s.handle(authAdmin, s.sshImport))
 	mux.HandleFunc("GET /v1/ssh/key", s.handle(authSession, s.sshPubkey))
 	mux.HandleFunc("POST /v1/ssh/allow", s.handle(authSession, s.sshAllow))
+	mux.HandleFunc("POST /v1/ssh/unpin", s.handle(authAdmin, s.sshUnpin))
 	mux.HandleFunc("GET /v1/whoami", s.handle(authSession, s.whoami))
 	mux.HandleFunc("GET /v1/list", s.handle(authSession, s.list))
 	mux.HandleFunc("GET /v1/item", s.handle(authSession, s.getItem))
@@ -202,9 +204,11 @@ func (s *Server) connect(r *http.Request, c *caller) (any, error) {
 		resp.Explanation = "this repository already has a folder; no new folder created. "
 	}
 
-	// 3. LLM: when nothing matched, or the agent asked for folders it doesn't have yet.
+	// 3. LLM: when the session has no folder at all, or the agent asked for
+	// folders it doesn't have yet. A session that already has its folders
+	// and connects again asks for nothing new, so nothing is judged.
 	pending := slices.DeleteFunc(slices.Clone(req.Folders), func(f string) bool { return have[f] })
-	if len(candidates) > 0 && (len(resp.Granted) == 0 || len(pending) > 0) {
+	if len(candidates) > 0 && (len(have) == 0 || len(pending) > 0) {
 		key, model := s.gatekeeper()
 		if key == "" {
 			resp.Explanation += "LLM gatekeeper not configured (the user can set it up with `agpass setup`); only repository matches are granted"
@@ -280,8 +284,32 @@ func (s *Server) sessionRepo(c *caller) (cwd, repo string, err error) {
 	return cwd, NormalizeRepo(GitOrigin(cwd)), nil
 }
 
-// agentRepos checks the repositories an agent wants on a folder: only its own
-// session's repository is allowed, so a folder can't be pushed onto another
+// normalizeRepos normalizes a repository list, dropping empty and repeated
+// entries.
+func normalizeRepos(in []string) []string {
+	out := []string{}
+	for _, r := range in {
+		if n := NormalizeRepo(r); n != "" && !slices.Contains(out, n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// editRepos unlinks rm from repos and links add, leaving the other entries
+// as they are. add and rm are normalized; entries are compared normalized.
+func editRepos(repos, add, rm []string) []string {
+	out := slices.DeleteFunc(slices.Clone(repos), func(r string) bool { return slices.Contains(rm, NormalizeRepo(r)) })
+	for _, a := range add {
+		if !slices.ContainsFunc(out, func(r string) bool { return NormalizeRepo(r) == a }) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// agentRepos checks the repositories an agent wants on a new folder: only its
+// own session's repository is allowed, so a folder can't be pushed onto another
 // project's sessions. nil means "this session's repository".
 func (s *Server) agentRepos(c *caller, want *[]string) ([]string, error) {
 	_, repo, err := s.sessionRepo(c)
@@ -568,6 +596,9 @@ func (s *Server) createFolder(r *http.Request, c *caller) (any, error) {
 			return nil, err
 		}
 		req.Repos = &repos
+	} else if req.Repos != nil {
+		repos := normalizeRepos(*req.Repos)
+		req.Repos = &repos
 	}
 	err := s.st.CreateFolder(req, c.String())
 	if errors.Is(err, store.ErrExists) {
@@ -594,15 +625,43 @@ func (s *Server) editFolder(r *http.Request, c *caller) (any, error) {
 		s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "folder-edit", Actor: c.String(), Target: req.Name})
 		return nil, err
 	}
-	if !c.full() && req.Repos != nil {
-		repos, err := s.agentRepos(c, req.Repos)
+	// An edit links and unlinks single repositories. Replacing the whole list
+	// (what "repos" did before 0.3.0) silently dropped the other links.
+	if req.Repos != nil {
+		return nil, errf(http.StatusBadRequest, api.ErrBadRequest,
+			"folder edit no longer replaces the repository list: use --repo to link and --rm-repo to unlink (update the agpass client)")
+	}
+	add, rm := normalizeRepos(req.AddRepos), normalizeRepos(req.RemoveRepos)
+	for _, a := range add {
+		if slices.Contains(rm, a) {
+			return nil, errf(http.StatusBadRequest, api.ErrBadRequest, "repository %s is both linked and unlinked", a)
+		}
+	}
+	if !c.full() && len(add)+len(rm) > 0 {
+		// Agents link and unlink only their own repository, so a folder can't
+		// be pushed onto, or taken from, another project's sessions.
+		_, repo, err := s.sessionRepo(c)
 		if err != nil {
-			s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "folder-edit", Actor: c.String(), Target: req.Name, Msg: err.Error()})
 			return nil, err
 		}
-		req.Repos = &repos
+		for _, n := range slices.Concat(add, rm) {
+			if n != repo {
+				err := errf(http.StatusForbidden, api.ErrForbidden,
+					"agents can only link or unlink their own repository (%s); ask the user to change %s", orNone(repo), n)
+				s.Log.Emit(events.Event{Level: events.LevelDeny, Action: "folder-edit", Actor: c.String(), Target: req.Name, Msg: err.Error()})
+				return nil, err
+			}
+		}
 	}
-	f, err := s.st.UpdateFolder(req, c.String())
+	f, err := s.st.UpdateFolder(req.Name, c.String(), func(f *api.Folder) {
+		if req.Project != nil {
+			f.Project = *req.Project
+		}
+		if req.Description != nil {
+			f.Description = *req.Description
+		}
+		f.Repos = editRepos(f.Repos, add, rm)
+	})
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, errf(http.StatusNotFound, api.ErrNotFound, "folder %q not found", req.Name)
 	}
@@ -616,8 +675,11 @@ func (s *Server) editFolder(r *http.Request, c *caller) (any, error) {
 	if req.Description != nil {
 		changed = append(changed, "description")
 	}
-	if req.Repos != nil {
-		changed = append(changed, "repos="+strings.Join(*req.Repos, ","))
+	for _, a := range add {
+		changed = append(changed, "repo+"+a)
+	}
+	for _, r := range rm {
+		changed = append(changed, "repo-"+r)
 	}
 	s.Log.Emit(events.Event{Level: events.LevelOK, Action: "folder-edit", Actor: c.String(), Target: req.Name, Msg: strings.Join(changed, " ")})
 	return f, nil
@@ -636,5 +698,9 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	cut := n - 1
+	for cut > 0 && !utf8.RuneStart(s[cut]) { // don't cut inside a character
+		cut--
+	}
+	return s[:cut] + "…"
 }

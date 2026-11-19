@@ -188,6 +188,17 @@ agpass set crm/db url:url=postgres://app:...@db/crm password:password=-     # "-
 Write folder descriptions for the gatekeeper: they are what it judges an
 agent's reason against.
 
+A folder can be linked to several repositories. `folder edit` changes one
+link at a time and leaves the others:
+
+```sh
+agpass folder edit crm --repo github.com/acme/crm-web        # link one more repository
+agpass folder edit crm --rm-repo github.com/acme/crm-web     # unlink it
+```
+
+Repositories are stored as `host/owner/repo`, whatever form you give
+(`git@github.com:acme/crm.git`, an https URL).
+
 ### 5. Let agents connect
 
 Nothing to do per session. In a project, tell Claude *connect to agpass*, or
@@ -235,6 +246,11 @@ limit.
 - `agpass ssh command` ignores `~/.ssh/config`, so your own `IdentityFile`
   entries can't slip in, and trusts only agpass's pinned `known_hosts`.
   Agents need real host names; your config's aliases don't apply.
+- Pinned host keys are never replaced on their own. When a host really
+  changed its keys (a rotation, a rebuilt server), agents get "Host key
+  verification failed" until you run `agpass ssh unpin HOST` (master
+  password; `HOST` as in `ssh allow`, e.g. `server:2222`). The next
+  `ssh allow` for that host pins the keys it serves then.
 - agpass sees the host, not the repository: a session allowed `github.com`
   can push wherever that key can. Scope the key on GitHub's side.
 
@@ -286,9 +302,9 @@ secrets without printing them, storing new ones, and SSH.
 - **Storage**: SQLite encrypted with the Adiantum VFS ([ncruces/go-sqlite3](https://github.com/ncruces/go-sqlite3), no cgo). A random 32-byte key is wrapped by your master password (Argon2id, XChaCha20-Poly1305) in `agpass.key`.
 - **Caller identity**: the server reads the socket peer pid, then walks up the parent processes to the nearest one running Anthropic-signed code: the kernel's hash of the running code (`csops`) must match a file at the kernel's executable path (`proc_pidpath`) that carries a valid Anthropic Developer ID signature. A session is bound to that Claude process's (pid, start time), so it ends when Claude exits.
 - **Sessions**: every verified Claude process gets a session on its first request. What it can read depends on its grants, unless it redeemed an admin code (`agpass mint` → `agpass elevate`): then it can access every folder, `SYSTEM` included, for 1 hour. Codes are single use, valid for 10 minutes, and all are revoked after 10 invalid attempts.
-- **Scoping**: `agpass connect` grants folders whose repos include the git remote of the Claude process's working directory, which the server reads itself. `connect --create` makes a folder for a repository that has none and grants it. Agents can link folders only to their own repository. Otherwise an LLM gatekeeper (OpenAI `gpt-6-luna`, reasoning effort low, structured output) decides from your folder descriptions and the agent's reason; folder text written by agents is marked untrusted. Folder names, projects, descriptions, repos and the agent's reason are sent to OpenAI with `store: false`. The key lives in `SYSTEM/openai` (`api_key`); an optional `model` field overrides the model. Sessions may edit folders they have, and they get folders they create. `SYSTEM` is never granted.
+- **Scoping**: `agpass connect` grants folders whose repos include the git remote of the Claude process's working directory, which the server reads itself. `connect --create` makes a folder for a repository that has none and grants it. Agents can link folders only to their own repository, and `folder edit` never replaces a folder's repository list: it links or unlinks one repository (for an agent, only its own). When a session has no folder at all, or asks for more with `connect --folder`, an LLM gatekeeper (OpenAI `gpt-6-luna`, reasoning effort low, structured output) decides from your folder descriptions and the agent's reason; folder text written by agents is marked untrusted. A session that already has its folders and connects again is not judged again. Folder names, projects, descriptions, repos and the agent's reason are sent to OpenAI with `store: false`. The key lives in `SYSTEM/openai` (`api_key`); an optional `model` field overrides the model. Sessions may edit folders they have, and they get folders they create. `SYSTEM` is never granted.
 - **Redaction**: `password` and `sensitive` fields, URL credentials, credential query parameters, and secret values repeated inside other fields all become `[REDACTED_AGPASS]`. `--reveal` returns plaintext and is logged as a warning.
-- **SSH agent**: `agent.sock` in the data directory. It offers the key only to sessions with an SSH grant (or admin access), and signs only an SSH `publickey` login whose session ID matches a verified `session-bind@openssh.com`, for a pinned host the session is allowed (any host for an admin session).
+- **SSH agent**: `agent.sock` in the data directory. It offers the key only to sessions with an SSH grant (or admin access), and signs only an SSH `publickey` login whose session ID matches a verified `session-bind@openssh.com`, for a pinned host the session is allowed (any host for an admin session). Host keys are pinned on the first allow and replaced only after `agpass ssh unpin HOST`.
 - **Audit**: every request is logged in the encrypted database and shown on the `serve` dashboard. Values are never logged; agent-written text is shown with control characters escaped.
 - **Rollback check**: every write bumps a generation counter. `serve` refuses a database older than the last one it saw.
 

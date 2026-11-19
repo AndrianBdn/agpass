@@ -19,8 +19,10 @@ What it may read depends on the repository it runs in.
    agpass connect --reason "fixing the CRM login bug; integration tests need the dev Postgres"
    ```
    agpass reads your working directory and its git `origin` itself. Folders
-   linked to that repository are granted. Other folders are decided by an LLM
-   gatekeeper from your reason; add `--folder NAME` for one you know you need.
+   linked to that repository are granted. If none is linked, an LLM gatekeeper
+   decides from your reason. For another folder you know you need, add
+   `--folder NAME`: the gatekeeper decides that too. Connecting again without
+   `--folder` changes nothing once you have folders.
 2. **No folder for this repository yet** (new project, first setup): create
    one and get it in the same step:
    ```sh
@@ -31,7 +33,8 @@ What it may read depends on the repository it runs in.
    when the user wants secrets for this project, and only when none exists.
 3. **If a folder is denied**, tell the user which one and why you need it. Don't
    retry with reworded reasons to talk your way in. The user can link it to this
-   repository: `agpass folder edit NAME --repo github.com/org/repo`.
+   repository: `agpass folder edit NAME --repo github.com/org/repo` (adds the
+   link; the folder's other repositories stay).
 4. **"server is not running"**: ask the user to start `agpass serve` in a
    terminal tab. Don't start it yourself: it needs the master password.
    **"not running under a recognised agent"**: your command runs outside the
@@ -112,7 +115,9 @@ agpass set crm/db --rm old_key
 A project's first folder comes from `connect --create` (above). For an extra
 folder in the same project: `agpass folder create NAME --project P --desc D`.
 Folders you create are linked to your own repository only; agpass refuses
-other repositories. Write descriptions for the user and the gatekeeper: what
+other repositories. On a folder you have, `agpass folder edit NAME --repo R`
+links and `--rm-repo R` unlinks your own repository; links to other
+repositories stay and only the user can change them. Write descriptions for the user and the gatekeeper: what
 the secrets are and which project uses them. Never put instructions or access
 policy in them.
 
@@ -134,6 +139,11 @@ $(agpass ssh command) deploy@server.example.com -p 2222 'systemctl status app'
   ports, not aliases from the user's ssh config.
 - Never use the user's own keys (`~/.ssh/id_*`, their ssh-agent) for work
   agpass should cover, and never forward the agent (`-A`).
+- "Host key verification failed": run `agpass ssh allow` for that exact host
+  and port first. If it still fails, the host's keys differ from the ones
+  agpass pinned. Don't work around it (no `StrictHostKeyChecking=no`, no other
+  known_hosts file): tell the user, who decides whether the change is expected
+  and runs `agpass ssh unpin HOST` in their own terminal; then `ssh allow` again.
 - "Permission denied (publickey)" after a grant means the agpass public key is
   not on that account or server yet: tell the user to add the output of
   `agpass ssh key`.
@@ -152,6 +162,6 @@ $(agpass ssh command) deploy@server.example.com -p 2222 'systemctl status app'
 | `agpass get folder/item [--field K] [--reveal] [--json]` | redacted unless `--reveal` |
 | `agpass set folder/item key[:type]=value ... [--rm key]` | `value` of `-` reads stdin |
 | `agpass folder create NAME --project P [--desc D]` | linked to your repository |
-| `agpass folder edit NAME [--project P] [--desc D]` | only folders you have |
+| `agpass folder edit NAME [--project P] [--desc D] [--repo R] [--rm-repo R]` | only folders you have; `--repo`/`--rm-repo` link/unlink your own repository |
 
 `SYSTEM` holds agpass's own keys and is never available to agents.

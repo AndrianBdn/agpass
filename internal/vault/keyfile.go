@@ -1,6 +1,8 @@
 // Package vault manages agpass.key: a random data key (DEK) wrapped with a
 // key derived from the master password (Argon2id + XChaCha20-Poly1305).
-// Changing the master password only re-wraps the DEK.
+// The database is encrypted with the DEK, never with the password itself.
+// (There is no command to change the master password yet; it would only
+// need to re-wrap the DEK.)
 package vault
 
 import (

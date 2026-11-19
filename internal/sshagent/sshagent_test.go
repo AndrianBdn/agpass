@@ -53,12 +53,17 @@ func TestNormalizeHost(t *testing.T) {
 		"ssh://git@h:22":       "h",
 		"server:2222":          "server:2222",
 		"ssh://deploy@x:2200/": "x:2200",
+		"10.0.0.5":             "10.0.0.5",
+		"[::1]":                "::1",
+		"[::1]:2222":           "[::1]:2222",
+		"my_host.internal":     "my_host.internal",
 	} {
 		if got, err := NormalizeHost(in); err != nil || got != want {
 			t.Errorf("NormalizeHost(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	for _, bad := range []string{"", "a b", "h:0", "h:99999"} {
+	// Nothing that means something in a known_hosts line.
+	for _, bad := range []string{"", "a b", "h:0", "h:99999", "a\tb", "a\nb", "a,b", "*.example.com", "!h", "|1|x", "-oProxyCommand=x", "h/x"} {
 		if _, err := NormalizeHost(bad); err == nil {
 			t.Errorf("NormalizeHost(%q) should fail", bad)
 		}

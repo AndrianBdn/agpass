@@ -14,6 +14,11 @@ func TestNormalizeRepo(t *testing.T) {
 		"https://x-access-token:t@github.com/a/b": "github.com/a/b",
 		"ssh://git@github.com/acme/crm.git":       "github.com/acme/crm",
 		"github.com/acme/crm":                     "github.com/acme/crm",
+		"ssh://git@github.com:22/acme/crm.git":    "github.com/acme/crm",
+		"ssh://git@git.example.com:2222/acme/crm": "git.example.com:2222/acme/crm",
+		"https://gitlab.example.com:443/a/b.git":  "gitlab.example.com/a/b",
+		"https://gitlab.example.com:8443/a/b":     "gitlab.example.com:8443/a/b",
+		"git@example.com:22/crm.git":              "example.com/22/crm", // scp-like: 22 is a directory
 		"":                                        "",
 	}
 	for in, want := range cases {

@@ -62,7 +62,9 @@ Access flow for `connect`:
 
 Invariants:
 - `mint` is refused for a requester running under an agent, even with the master password (`agentAncestor` in the server and in the CLI).
-- Agents may only link folders to their own repository.
+- Agents may only link folders to their own repository, and unlink only their own. `folder edit` never replaces a folder's repository list (`add_repos`/`remove_repos`), so one session can't drop another project's link.
+- The gatekeeper judges folder access only for a session with no folder at all, or for folders it asks for by name (`connect --folder`); connecting again must not widen access.
+- Pinned SSH host keys are replaced only by the human (`ssh unpin`, master password), never by a session.
 - `SYSTEM` (gatekeeper key in `SYSTEM/openai`, SSH key in `SYSTEM/ssh`) is never granted to a plain session.
 - `SYSTEM/ssh` can't be read or replaced even by an elevated session, only with the master password (`sshKeyGuard`).
 

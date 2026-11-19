@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultModel is used unless SYSTEM/openai has a "model" field.
@@ -244,6 +245,9 @@ func (r *response) text() (string, error) {
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) { // don't cut inside a character
+		n--
 	}
 	return s[:n] + "…"
 }

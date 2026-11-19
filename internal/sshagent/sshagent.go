@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -201,6 +202,11 @@ func SameKey(a, b ssh.PublicKey) bool {
 	return a != nil && b != nil && bytes.Equal(a.Marshal(), b.Marshal())
 }
 
+// hostRe is what a host name or IP address may look like. The host ends up in
+// agpass's known_hosts file, where spaces, tabs, commas, "*", "?", "!" and
+// "|" have a meaning, so none of them is accepted.
+var hostRe = regexp.MustCompile(`^[a-z0-9:][a-z0-9._:-]*$`)
+
 // NormalizeHost turns "github.com", "git@github.com", "ssh://h:2222" or
 // "h:22" into "github.com" or "h:2222" (port only when not 22).
 func NormalizeHost(h string) (string, error) {
@@ -214,8 +220,11 @@ func NormalizeHost(h string) (string, error) {
 	if hh, pp, err := net.SplitHostPort(h); err == nil {
 		host, port = hh, pp
 	}
-	if host == "" || strings.ContainsAny(host, "/ ") {
-		return "", fmt.Errorf("invalid host %q", h)
+	if len(host) > 2 && host[0] == '[' && host[len(host)-1] == ']' { // [::1] without a port
+		host = host[1 : len(host)-1]
+	}
+	if !hostRe.MatchString(host) {
+		return "", fmt.Errorf("invalid host %q: give a host name or IP address, optionally with :port", h)
 	}
 	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
 		return "", fmt.Errorf("invalid port in %q", h)

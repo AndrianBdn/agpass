@@ -7,6 +7,10 @@ import (
 	"strings"
 )
 
+// defaultPorts are dropped from a URL's host, so ssh://git@h:22/x/y is the
+// same repository as git@h:x/y.
+var defaultPorts = map[string]string{"ssh": "22", "git+ssh": "22", "ssh+git": "22", "https": "443", "http": "80", "git": "9418"}
+
 // NormalizeRepo turns git remotes into host/owner/repo:
 // git@github.com:x/crm.git, https://github.com/x/crm → github.com/x/crm.
 func NormalizeRepo(r string) string {
@@ -14,8 +18,9 @@ func NormalizeRepo(r string) string {
 	if r == "" {
 		return ""
 	}
+	scheme := ""
 	if i := strings.Index(r, "://"); i >= 0 {
-		r = r[i+3:]
+		scheme, r = r[:i], r[i+3:]
 	} else if c := strings.IndexByte(r, ':'); c >= 0 && (strings.IndexByte(r, '/') < 0 || c < strings.IndexByte(r, '/')) {
 		r = r[:c] + "/" + r[c+1:] // scp-like syntax
 	}
@@ -25,6 +30,12 @@ func NormalizeRepo(r string) string {
 	}
 	if at := strings.LastIndexByte(r[:hostEnd], '@'); at >= 0 {
 		r = r[at+1:]
+		hostEnd -= at + 1
+	}
+	if port := defaultPorts[scheme]; port != "" {
+		if h, ok := strings.CutSuffix(r[:hostEnd], ":"+port); ok {
+			r = h + r[hostEnd:]
+		}
 	}
 	r = strings.TrimSuffix(r, "/")
 	r = strings.TrimSuffix(r, ".git")

@@ -196,7 +196,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	// Handlers may still be running after Shutdown returns; give them a
 	// bounded time to notice the cancellation before the store closes.
 	drained := make(chan struct{})
-	go func() { s.inflight.Wait(); close(drained) }()
+	go func() { s.inflight.Wait(); s.agent.wg.Wait(); close(drained) }()
 	select {
 	case <-drained:
 	case <-time.After(shutdownGrace):

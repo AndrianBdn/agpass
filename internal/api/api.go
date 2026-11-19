@@ -3,7 +3,7 @@ package api
 
 import "time"
 
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 const (
 	HeaderVersion = "X-Agpass-Version"
@@ -133,6 +133,17 @@ type SSHAllowResponse struct {
 	HostKeys    []string `json:"host_keys,omitempty"` // fingerprints pinned for the host
 }
 
+// SSHUnpinRequest is the body of POST /v1/ssh/unpin.
+type SSHUnpinRequest struct {
+	Host string `json:"host"`
+}
+
+// SSHUnpinResponse answers POST /v1/ssh/unpin.
+type SSHUnpinResponse struct {
+	Host    string `json:"host"`
+	Removed int    `json:"removed"` // host keys forgotten
+}
+
 // SSHKeyRequest is the body of POST /v1/ssh/keygen and /v1/ssh/import.
 type SSHKeyRequest struct {
 	PrivateKey string `json:"private_key,omitempty"` // import: OpenSSH PEM, unencrypted
@@ -215,8 +226,13 @@ type SetItemRequest struct {
 
 // FolderRequest creates (all fields) or edits (nil = unchanged) a folder.
 type FolderRequest struct {
-	Name        string    `json:"name"`
-	Project     *string   `json:"project,omitempty"`
-	Description *string   `json:"description,omitempty"`
+	Name        string  `json:"name"`
+	Project     *string `json:"project,omitempty"`
+	Description *string `json:"description,omitempty"`
+	// Repos is the repository list of a new folder. An edit never replaces
+	// the list: it links (AddRepos) and unlinks (RemoveRepos) repositories
+	// and leaves the others alone.
 	Repos       *[]string `json:"repos,omitempty"`
+	AddRepos    []string  `json:"add_repos,omitempty"`
+	RemoveRepos []string  `json:"remove_repos,omitempty"`
 }

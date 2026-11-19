@@ -22,6 +22,7 @@ Human (master password):
   agpass ssh keygen [--comment C] [--force]     create an Ed25519 key
   agpass ssh import FILE [--comment C] [--force]  import an existing private key
   agpass ssh key                                 show the public key to add on GitHub / servers
+  agpass ssh unpin HOST                          forget HOST's pinned host keys (see below)
 
 Agent:
   agpass ssh allow --host github.com --reason "push the fix to acme/crm"
@@ -33,6 +34,12 @@ Agent:
 "agpass ssh command" ignores ~/.ssh/config (so only the agpass key is used) and
 accepts only hosts pinned by "ssh allow": give the real host name, user and
 port (-p), not aliases from your ssh config.
+
+A host's keys are pinned the first time a session is allowed to use it, and
+never replaced on their own. When a host really changed its keys (a rotation, a
+rebuilt server), ssh fails with "Host key verification failed": run
+"agpass ssh unpin HOST" (HOST as in ssh allow, e.g. server:2222), and the next
+"ssh allow" for it pins the keys it serves then.
 
 Requires OpenSSH 8.9 or newer (macOS has it). Forwarding (ssh -A) is refused.
 `
@@ -155,6 +162,28 @@ func cmdSSHAllow(args []string) error {
 		fmt.Printf("  host key %s\n", fp)
 	}
 	fmt.Printf("\nUse it with:  GIT_SSH_COMMAND=\"$(agpass ssh command)\" git push\n")
+	return nil
+}
+
+// cmdSSHUnpin forgets a host's pinned keys (master password).
+func cmdSSHUnpin(args []string) error {
+	fs, _ := flags("ssh unpin")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: agpass ssh unpin HOST")
+	}
+	c, err := newConn(true)
+	if err != nil {
+		return err
+	}
+	var resp api.SSHUnpinResponse
+	if err := c.call("POST", "/v1/ssh/unpin", nil, api.SSHUnpinRequest{Host: fs.Arg(0)}, &resp); err != nil {
+		return err
+	}
+	fmt.Println(ui.ok(fmt.Sprintf("Forgot %d pinned host keys of %s.", resp.Removed, clean(resp.Host))))
+	fmt.Println(ui.dim("The next `agpass ssh allow --host " + clean(resp.Host) + " …` pins the keys the host serves then."))
 	return nil
 }
 

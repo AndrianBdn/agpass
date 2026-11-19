@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -58,13 +59,18 @@ Agent (run inside Claude Code; each Claude process gets its own session automati
   agpass set folder/item key[:type]=value ... [--rm key]
                                    types: text (default), sensitive, password, url
                                    value "-" reads the value from the terminal/stdin
-  agpass folder create NAME --project P [--desc D]   (agents: linked to their own repository)
-  agpass folder edit NAME [--project P] [--desc D] [--repo R ...]
+  agpass folder create NAME --project P [--desc D] [--repo R ...]
+                                   --repo: repositories whose sessions get the folder
+                                   (agents: always their own repository)
+  agpass folder edit NAME [--project P] [--desc D] [--repo R ...] [--rm-repo R ...]
+                                   --repo links one more repository, --rm-repo unlinks one;
+                                   the other links stay (agents: only their own repository)
 
 SSH agent (one shared key, used through agpass; see agpass ssh help):
   agpass ssh keygen | import FILE  create or import the key (human)
   agpass ssh key                   public key to add on GitHub or servers
   agpass ssh allow --host H --reason R   let this session use the key for host H
+  agpass ssh unpin HOST            forget a host's pinned keys after it changed them (human)
   GIT_SSH_COMMAND="$(agpass ssh command)" git push
 
 Data: $AGPASS_DIR, else $XDG_DATA_HOME/agpass, else ~/.local/share/agpass
@@ -114,6 +120,7 @@ func init() {
 		"ssh import":    cmdSSHImport,
 		"ssh key":       cmdSSHKey,
 		"ssh allow":     cmdSSHAllow,
+		"ssh unpin":     cmdSSHUnpin,
 		"ssh command":   cmdSSHCommand,
 		"mint":          cmdMint,
 		"elevate":       cmdElevate,
@@ -667,7 +674,7 @@ func cmdFolderCreate(args []string) error {
 	fs, admin := flags("folder create")
 	project := fs.String("project", "", "project this folder is for (required)")
 	desc := fs.String("desc", "", "description: what these secrets are and who should use them")
-	repos := fs.StringArray("repo", nil, "repository that gets this folder automatically (repeatable)")
+	repos := fs.StringArray("repo", nil, "repository whose sessions get this folder automatically (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -691,30 +698,27 @@ func cmdFolderEdit(args []string) error {
 	fs, admin := flags("folder edit")
 	project := fs.String("project", "", "project")
 	desc := fs.String("desc", "", "description")
-	repos := fs.StringArray("repo", nil, "repositories (replaces the list; repeatable; --repo '' clears)")
+	repos := fs.StringArray("repo", nil, "link a repository: its sessions get this folder (repeatable; other links stay)")
+	rmRepos := fs.StringArray("rm-repo", nil, "unlink a repository (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: agpass folder edit NAME [--project P] [--desc D] [--repo R ...]")
+		return fmt.Errorf("usage: agpass folder edit NAME [--project P] [--desc D] [--repo R ...] [--rm-repo R ...]")
 	}
-	req := api.FolderRequest{Name: fs.Arg(0)}
+	for _, r := range slices.Concat(*repos, *rmRepos) {
+		if strings.TrimSpace(r) == "" {
+			return fmt.Errorf("empty repository: --repo links one repository and --rm-repo unlinks one (--repo '' no longer clears the list)")
+		}
+	}
+	req := api.FolderRequest{Name: fs.Arg(0), AddRepos: *repos, RemoveRepos: *rmRepos}
 	if fs.Changed("project") {
 		req.Project = project
 	}
 	if fs.Changed("desc") {
 		req.Description = desc
 	}
-	if fs.Changed("repo") {
-		rs := []string{}
-		for _, r := range *repos {
-			if r != "" {
-				rs = append(rs, r)
-			}
-		}
-		req.Repos = &rs
-	}
-	if req.Project == nil && req.Description == nil && req.Repos == nil {
+	if req.Project == nil && req.Description == nil && len(req.AddRepos)+len(req.RemoveRepos) == 0 {
 		return fmt.Errorf("nothing to change")
 	}
 	c, err := newConn(*admin)
@@ -725,6 +729,10 @@ func cmdFolderEdit(args []string) error {
 	if err := c.call("PATCH", "/v1/folder", nil, req, &f); err != nil {
 		return err
 	}
-	fmt.Printf("updated folder %s\n", f.Name)
+	fmt.Printf("updated folder %s", f.Name)
+	if len(req.AddRepos)+len(req.RemoveRepos) > 0 {
+		fmt.Printf(" · repos: %s", orDash(clean(strings.Join(f.Repos, ", "))))
+	}
+	fmt.Println()
 	return nil
 }
